@@ -1,0 +1,772 @@
+#!/usr/bin/env python3
+"""pi-shepherd: watch one Pi coding agent in a Rex block and report each actionable event once.
+
+No LLM. A Hermes coordinator session runs `wait` as a background process with
+notify_on_complete, so the session wakes when the process exits.
+
+  pi-shepherd wait    <session> <block> [--timeout 1h] [--stall 15m] [--poll 20s]
+  pi-shepherd context <session> <block>
+  pi-shepherd status  [session]
+
+Exit codes of `wait` (the first line of output is `EVENT <NAME> <session> <block> ...`):
+  0 DONE      turn finished normally
+  1 QUESTION  turn finished and the last assistant text asks the user to decide
+  2 QUOTA     usage or rate limit error (provider, model and reset time printed when known)
+  3 API_ERROR any other provider or transport error
+  4 BLOCKED   Pi waits on a dialog or a login (kind and message printed)
+  5 STALLED   working or idle, but no session-log change and no screen change for --stall
+  6 GONE      block missing, no status records, or the Pi process exited
+  7 TIMEOUT   no event within --timeout (Pi may still run)
+  8 STOPPED   a newer wait for the same block replaced this one
+  9 ERROR     rex unreachable 10 polls in a row
+ 10 ABORTED   the turn was interrupted (Pi is idle)
+ 64 usage error
+
+A settled turn is reported once. The key is the last settled assistant entry of the
+Pi session log (else the status timestamp), kept in the state dir. The first wait on a
+block treats the turn that is already finished as old.
+State lives in $PI_SHEPHERD_STATE_DIR, else $HERMES_HOME/data/pi-shepherd,
+else ~/.local/state/pi-shepherd. Stdlib only.
+"""
+import argparse
+import errno
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+EXIT = {"DONE": 0, "QUESTION": 1, "QUOTA": 2, "API_ERROR": 3, "BLOCKED": 4, "STALLED": 5,
+        "GONE": 6, "TIMEOUT": 7, "STOPPED": 8, "ERROR": 9, "ABORTED": 10}
+EXIT_USAGE = 64
+
+STATE_WORKING, STATE_DONE, STATE_ERROR, STATE_IDLE, STATE_BLOCKED = (
+    "working", "done", "error", "idle", "blocked")
+STOP_TOOL_USE, STOP_ERROR, STOP_ABORTED = "toolUse", "error", "aborted"
+ROLE_ASSISTANT = "assistant"
+ENTRY_MESSAGE = "message"
+
+REX_NOT_FOUND_EXIT = 3
+REX_TIMEOUT = 30
+REX_FAILURE_LIMIT = 10
+EMPTY_STATUS_LIMIT = 3
+LOG_SCAN_LIMIT = 32 * 1024 * 1024
+LOG_CHUNK = 256 * 1024
+SCREEN_TAIL_LINES = 25
+TEXT_EXCERPT = 1500
+QUESTION_LIMIT = 6000
+ERROR_LIMIT = 600
+SESSIONS_SUBDIR = "sessions"
+DEFAULT_AGENT_DIR = "~/.pi/agent"
+AGENT_DIR_VAR = "PI_CODING_AGENT_DIR"
+PI_APP = "pi"
+
+QUOTA_PATTERN = re.compile(
+    r"usage limit|hit your .{0,40}limit|rate.?limit|(?<![a-z0-9])429(?![a-z0-9])|quota|spend limit|"
+    r"too many requests|billing|available balance|out of budget", re.I)
+RESET_PATTERN = re.compile(
+    r"resets?\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m(?:\s*\([A-Za-z0-9_/+\-]+\))?)", re.I)
+QUESTION_PHRASES = re.compile(
+    r"\b(should i|shall i|do you want|would you like|want me to|which (?:one|option|approach|way)|"
+    r"how would you like|please (?:choose|confirm|decide|advise|let me know)|need (?:a|your) (?:decision|answer|input|confirmation)|"
+    r"before i proceed|waiting for your|your call|let me know which)\b", re.I)
+OPTION_LINE = re.compile(r"^\s*(?:[-*]\s*)?(?:option\s+[a-z0-9]+\b|\(?[A-Da-d][).]\s)", re.I)
+FENCE = re.compile(r"```.*?```", re.S)
+MARKUP = re.compile(r"[*_`>#]+")
+SPINNER = re.compile("[\u2800-\u28ff]")
+ELAPSED_LINE = re.compile(r"^\s*elapsed\b", re.I)
+FOOTER_MODEL = re.compile("\U0001F916\\s*([\\x20-\\x7e]+?)\\s*(?=[^\\x00-\\x7f]|$)")
+FOOTER_THINKING = re.compile("\U0001F9E0\\s*([A-Za-z]+)")
+
+
+# ---------------------------------------------------------------- utilities
+
+def parse_duration(text):
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd]?)\s*", str(text))
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad duration: {text!r} (use 90, 90s, 30m, 2h, 1d)")
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def first_line(text, limit=160):
+    text = (text or "").strip()
+    line = text.splitlines()[0] if text else ""
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def clip(text, limit):
+    text = text or ""
+    return text if len(text) <= limit else "…" + text[-(limit - 1):]
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def state_dir():
+    base = os.environ.get("PI_SHEPHERD_STATE_DIR")
+    if not base:
+        hermes = os.environ.get("HERMES_HOME")
+        base = os.path.join(hermes, "data", "pi-shepherd") if hermes else os.path.expanduser(
+            "~/.local/state/pi-shepherd")
+    private_dir(base)
+    return base
+
+
+def out_dir():
+    path = os.path.join(os.environ.get("TMPDIR") or tempfile.gettempdir(), "pi-shepherd")
+    private_dir(path)
+    return path
+
+
+class FileError(RuntimeError):
+    pass
+
+
+def private_dir(path):
+    """Create `path` with mode 0700; tighten an existing one that we own and others can use."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.stat(path)
+    if st.st_uid == os.getuid() and st.st_mode & 0o077:
+        os.chmod(path, 0o700)
+
+
+def write_private(path, text):
+    """Write `text` to `path` with mode 0600, refusing to follow a symlink at `path`."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as e:
+        reason = "it is a symlink" if e.errno == errno.ELOOP else e.strerror
+        raise FileError(f"cannot write {path}: {reason}") from e
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)  # an older file may have had wider permissions
+        f.write(text)
+
+
+def block_key(session, block):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", f"{session}__{block}")
+
+
+def load_state(key):
+    try:
+        with open(os.path.join(state_dir(), key + ".json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(key, state):
+    path = os.path.join(state_dir(), key + ".json")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".state-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- Rex and host
+
+class RexError(RuntimeError):
+    pass
+
+
+class RexGone(RexError):
+    """The block or session does not exist."""
+
+
+class Rex:
+    """Thin wrapper over the rex CLI. Tests replace it with a fake."""
+
+    def run(self, *args):
+        try:
+            r = subprocess.run(["rex", *args], capture_output=True, text=True, timeout=REX_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise RexError(str(e) or type(e).__name__)
+        if r.returncode == REX_NOT_FOUND_EXIT and "not found" in r.stderr:
+            raise RexGone(first_line(r.stderr, 300))
+        if r.returncode != 0:
+            raise RexError(first_line(r.stderr or r.stdout, 300) or f"rex exited {r.returncode}")
+        return r.stdout
+
+    def json(self, *args):
+        try:
+            return json.loads(self.run(*args))
+        except ValueError as e:
+            raise RexError(f"bad JSON from rex: {e}")
+
+    def status(self, session, block):
+        data = self.json("block", "call", "-s", session, "-b", block, "program_status")
+        return data.get("records") or []
+
+    def capture(self, session, block):
+        return self.run("capture", "-s", session, "-b", block, "--trim")
+
+    def sessions(self):
+        return [(s.get("session_id") or s.get("id"), s.get("label", ""))
+                for s in self.json("ls", "--json").get("sessions", [])]
+
+    def blocks(self, session):
+        return self.json("block", "ls", "-s", session, "--json").get("blocks", [])
+
+    def windows(self, session):
+        data = self.json("window", "ls", "-s", session, "--json")
+        return {w.get("window_id"): w.get("label", "") for w in data.get("windows", [])}
+
+
+def encode_cwd(path):
+    return "--" + re.sub(r"[/\\:]", "-", path.lstrip("/")) + "--"
+
+
+def environ_value(raw, name):
+    """One variable from a /proc/<pid>/environ blob. Nothing else is read or kept."""
+    prefix = (name + "=").encode()
+    for item in raw.split(b"\0"):
+        if item.startswith(prefix):
+            return item[len(prefix):].decode(errors="replace")
+    return ""
+
+
+class Host:
+    """Process facts for a Pi pid. Tests replace it with a fake."""
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def cwd(self, pid):
+        return os.readlink(f"/proc/{pid}/cwd")
+
+    def session_dir(self, pid):
+        cwd = self.cwd(pid)
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            agent = environ_value(f.read(), AGENT_DIR_VAR)
+        root = os.path.join(os.path.expanduser(agent or DEFAULT_AGENT_DIR), SESSIONS_SUBDIR)
+        exact = os.path.join(root, encode_cwd(cwd))
+        if os.path.isdir(exact):
+            return exact
+        squash = lambda s: re.sub(r"[^A-Za-z0-9]", "-", s)
+        for name in os.listdir(root):
+            if squash(name) == squash(encode_cwd(cwd)):
+                return os.path.join(root, name)
+        return exact
+
+
+# ---------------------------------------------------------------- session log
+
+class Log:
+    """What the end of a Pi session log says. `settled` is the latest assistant message that ended a step."""
+
+    def __init__(self):
+        self.path = None
+        self.size = 0
+        self.last_id = None
+        self.last_message_id = None
+        self.last_role = None
+        self.settled = None
+        self.text = ""
+        self.last_error = None
+
+
+def reversed_lines(path):
+    scanned = 0
+    with open(path, "rb") as f:
+        pos = f.seek(0, os.SEEK_END)
+        buf = b""
+        while pos > 0 and scanned < LOG_SCAN_LIMIT:
+            size = min(LOG_CHUNK, pos)
+            pos -= size
+            f.seek(pos)
+            buf = f.read(size) + buf
+            scanned += size
+            parts = buf.split(b"\n")
+            buf = parts[0]
+            for line in reversed(parts[1:]):
+                if line.strip():
+                    yield line
+        if pos == 0 and buf.strip():
+            yield buf
+
+
+def message_text(message):
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    return "\n".join(p.get("text", "") for p in content or []
+                     if isinstance(p, dict) and p.get("type") == "text").strip()
+
+
+def assistant_info(entry):
+    m = entry["message"]
+    return {"id": entry.get("id"), "timestamp": entry.get("timestamp"), "stop": m.get("stopReason"),
+            "error": m.get("errorMessage") or "", "text": message_text(m),
+            "provider": m.get("provider") or "", "model": m.get("model") or ""}
+
+
+def newest_log_file(directory):
+    try:
+        files = [os.path.join(directory, n) for n in os.listdir(directory) if n.endswith(".jsonl")]
+    except OSError:
+        return None
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def read_log(directory, deep=False):
+    """Read from the end of the newest session log. `deep` also finds the last text and the last error."""
+    log = Log()
+    path = newest_log_file(directory) if directory else None
+    if not path:
+        return None
+    log.path, log.size = path, os.path.getsize(path)
+    for raw in reversed_lines(path):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if log.last_id is None:
+            log.last_id = entry.get("id")
+        if entry.get("type") != ENTRY_MESSAGE or not isinstance(entry.get("message"), dict):
+            continue
+        role = entry["message"].get("role")
+        if log.last_role is None:
+            log.last_role, log.last_message_id = role, entry.get("id")
+        if role != ROLE_ASSISTANT:
+            continue
+        info = assistant_info(entry)
+        if info["stop"] == STOP_TOOL_USE:
+            continue
+        if log.settled is None:
+            log.settled = info
+            log.text = info["text"]
+        if not log.text and info["text"]:
+            log.text = info["text"]
+        if log.last_error is None and info["stop"] == STOP_ERROR:
+            log.last_error = info
+        if not deep and log.settled:
+            break
+    return log
+
+
+# ---------------------------------------------------------------- classification
+
+def asks_question(text):
+    """Deterministic heuristic: the last paragraph asks the user to decide."""
+    body = FENCE.sub("", text or "").strip()
+    if not body:
+        return False
+    paragraphs = [p for p in re.split(r"\n\s*\n", body) if p.strip()]
+    last = paragraphs[-1]
+    last_line = MARKUP.sub("", last.strip().splitlines()[-1]).strip().rstrip(")\"'” ")
+    if last_line.endswith("?"):
+        return True
+    if QUESTION_PHRASES.search(last):
+        return True
+    return sum(1 for ln in last.splitlines() if OPTION_LINE.match(ln)) >= 2
+
+
+def classify_error(message):
+    return "QUOTA" if QUOTA_PATTERN.search(message or "") else "API_ERROR"
+
+
+def reset_time(message):
+    m = RESET_PATTERN.search(message or "")
+    return m.group(1).strip() if m else ""
+
+
+def parse_footer(screen):
+    """(model, thinking) from the last footer line (the one with the robot emoji)."""
+    for line in reversed((screen or "").splitlines()):
+        if "\U0001F916" in line:
+            model = FOOTER_MODEL.search(line)
+            thinking = FOOTER_THINKING.search(line)
+            return (model.group(1) if model else "", thinking.group(1).lower() if thinking else "")
+    return ("", "")
+
+
+def screen_signature(screen):
+    lines = [SPINNER.sub("", ln).rstrip() for ln in (screen or "").splitlines() if not ELAPSED_LINE.match(ln)]
+    return "\n".join(lines)
+
+
+def screen_tail(screen, n=SCREEN_TAIL_LINES):
+    lines = [ln.rstrip() for ln in (screen or "").splitlines() if ln.strip()]
+    return "\n".join(lines[-n:])
+
+
+# ---------------------------------------------------------------- event output
+
+class Snapshot:
+    """One poll: Rex status plus the log and screen that go with it."""
+
+    def __init__(self, record, log, screen):
+        self.record, self.log, self.screen = record, log, screen
+        self.state = record.get("state", "")
+        self.model, self.thinking = parse_footer(screen)
+
+    @property
+    def pid(self):
+        return (self.record.get("owner") or {}).get("pid")
+
+    def turn_marker(self):
+        """Identity of the settled turn: the log entry id, else the status timestamp."""
+        if self.log is not None:
+            return self.log.settled["id"] if self.log.settled else None
+        return "status:" + str(self.record.get("updated_at"))
+
+    def blocked_marker(self):
+        return "|".join(str(self.record.get(k, "")) for k in ("kind", "message", "updated_at"))
+
+
+def event_block(event, session, block, snap, detail):
+    head = f"EVENT {event} {session} {block}"
+    if snap:
+        head += f" state={snap.state}"
+        if snap.model:
+            head += f" model={snap.model}"
+        if snap.thinking:
+            head += f" thinking={snap.thinking}"
+    lines = [head] + detail
+    if snap and snap.screen:
+        lines += ["--- screen tail", screen_tail(snap.screen)]
+    lines.append(f"next: pi-shepherd context {session} {block}")
+    return "\n".join(lines)
+
+
+def turn_detail(event, snap):
+    settled = snap.log.settled if snap.log else None
+    text = (settled or {}).get("text", "")
+    detail = [f"state: {snap.state}", f"model: {snap.model or '?'} thinking: {snap.thinking or '?'}"]
+    if event == "QUESTION":
+        detail += ["question (full last assistant text):", clip(text, QUESTION_LIMIT)]
+    elif event in ("QUOTA", "API_ERROR"):
+        error = (settled or {}).get("error") or snap.record.get("message") or ""
+        provider = "/".join(p for p in ((settled or {}).get("provider"), (settled or {}).get("model")) if p)
+        if provider:
+            detail.append(f"provider/model: {provider}")
+        detail.append(f"error: {clip(error, ERROR_LIMIT)}")
+        reset = reset_time(error)
+        if event == "QUOTA" and reset:
+            detail.append(f"reset: {reset}")
+    elif text:
+        detail += ["last assistant text:", clip(text, TEXT_EXCERPT)]
+    return detail
+
+
+# ---------------------------------------------------------------- wait
+
+class Stopped(Exception):
+    pass
+
+
+def snapshot(rex, host, session, block, record):
+    log = None
+    pid = (record.get("owner") or {}).get("pid")
+    if pid:
+        try:
+            log = read_log(host.session_dir(pid))
+        except OSError:
+            log = None
+    try:
+        screen = rex.capture(session, block)
+    except RexError:
+        screen = ""
+    return Snapshot(record, log, screen)
+
+
+def settled_event(snap, reported):
+    """The event for a settled turn that was not reported yet, else None."""
+    marker = snap.turn_marker()
+    if marker == reported:
+        return None
+    log, state = snap.log, snap.state
+    if state == STATE_DONE:
+        if log is not None and (not log.settled or log.last_message_id != log.settled["id"]):
+            return None  # the next prompt is already in the log: status still shows the old turn
+        return "QUESTION" if asks_question((log.settled["text"] if log else "")) else "DONE"
+    if state == STATE_ERROR:
+        error = (log.settled["error"] if log and log.settled else "") or snap.record.get("message", "")
+        return classify_error(error)
+    if state == STATE_IDLE and log is not None and log.settled and log.settled["stop"] == STOP_ABORTED:
+        return "ABORTED"
+    return None
+
+
+def run_wait(args, rex=None, host=None, clock=time.time, sleep=time.sleep, out=print):
+    rex, host = rex or Rex(), host or Host()
+    session, block = args.session, args.block
+    key = block_key(session, block)
+    state = load_state(key)
+    deadline = clock() + args.timeout
+    failures, last_error, empty = 0, "", 0
+    last_signature, last_progress = None, clock()
+    snap = None
+
+    def finish(event, detail, final=None):
+        final = final if final is not None else snap
+        state["last_event"] = {"name": event, "at": now_iso()}
+        save_state(key, state)
+        out(event_block(event, session, block, final, detail))
+        return EXIT[event]
+
+    while True:
+        try:
+            records = rex.status(session, block)
+            failures = 0
+        except RexGone as e:
+            return finish("GONE", [f"block missing: {e}"], None)
+        except RexError as e:
+            failures, last_error = failures + 1, str(e)
+            if failures >= REX_FAILURE_LIMIT:
+                return finish("ERROR", [f"rex failed {failures} times in a row: {last_error}"], None)
+            if clock() >= deadline:
+                return finish("TIMEOUT", [f"last rex error: {last_error}"], None)
+            sleep(args.poll)
+            continue
+
+        if not records:
+            empty += 1
+            if empty >= EMPTY_STATUS_LIMIT:
+                return finish("GONE", ["no status records: Pi exited or never started in this block"], None)
+            sleep(args.poll)
+            continue
+        empty = 0
+        record = records[0]
+        pid = (record.get("owner") or {}).get("pid")
+        if pid and not host.alive(pid):
+            return finish("GONE", [f"the Pi process (pid {pid}) exited"], Snapshot(record, None, ""))
+
+        snap = snapshot(rex, host, session, block, record)
+        if "reported" not in state:  # first wait on this block: the finished turn is old
+            state["reported"] = snap.turn_marker()
+            save_state(key, state)
+
+        if snap.state == STATE_BLOCKED:
+            marker = snap.blocked_marker()
+            if marker != state.get("reported_blocked"):
+                state["reported_blocked"] = marker
+                detail = [f"state: blocked", f"kind: {record.get('kind', '?')}",
+                          f"message: {record.get('message', '')}"]
+                return finish("BLOCKED", detail)
+        else:
+            event = settled_event(snap, state.get("reported"))
+            if event:
+                state["reported"] = snap.turn_marker()
+                return finish(event, turn_detail(event, snap))
+
+        progress = (snap.log.path, snap.log.size) if snap.log else None
+        signature = (progress, screen_signature(snap.screen), snap.state)
+        t = clock()
+        if signature != last_signature:
+            last_signature, last_progress = signature, t
+        stalling = snap.state in (STATE_WORKING, STATE_IDLE, STATE_DONE)
+        if args.stall and stalling and t - last_progress >= args.stall:
+            return finish("STALLED", [f"state: {snap.state}",
+                                      f"no session-log change and no screen change for {int(t - last_progress)}s"])
+        if t >= deadline:
+            return finish("TIMEOUT", [f"state: {snap.state}", f"no event in {args.timeout}s; Pi may still be running"])
+        sleep(args.poll)
+
+
+def alive_wait(pid, session, block):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = [a.decode(errors="replace") for a in f.read().split(b"\0")]
+    except OSError:
+        return False
+    return any(a.endswith("pi-shepherd") for a in argv) and "wait" in argv and session in argv and block in argv
+
+
+def replace_previous_wait(session, block, out):
+    """One wait per block: stop an older wait, then record this one."""
+    pidfile = os.path.join(state_dir(), block_key(session, block) + ".pid")
+    try:
+        with open(pidfile) as f:
+            old = int(f.read().strip())
+    except (OSError, ValueError):
+        old = None
+    if old and old != os.getpid() and alive_wait(old, session, block):
+        os.kill(old, signal.SIGTERM)
+        for _ in range(50):
+            if not alive_wait(old, session, block):
+                break
+            time.sleep(0.1)
+        out(f"replaced previous wait pid={old}")
+    write_private(pidfile, str(os.getpid()))
+    return pidfile
+
+
+def say(text):
+    print(text, flush=True)
+
+
+def cmd_wait(args):
+    try:
+        pidfile = replace_previous_wait(args.session, args.block, say)
+    except FileError as e:
+        print(f"pi-shepherd: {e}", file=sys.stderr)
+        return EXIT["ERROR"]
+
+    def on_signal(signum, _frame):
+        raise Stopped(signal.Signals(signum).name)
+
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, on_signal)
+    say(f"watching {args.session} {args.block} timeout={args.timeout}s stall={args.stall}s "
+        f"poll={args.poll}s pid={os.getpid()}")
+    try:
+        code = run_wait(args, out=say)
+    except Stopped as e:
+        say(f"EVENT STOPPED {args.session} {args.block} by {e} (replaced by a newer wait or killed)")
+        code = EXIT["STOPPED"]
+    finally:
+        try:
+            with open(pidfile) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(pidfile)
+        except OSError:
+            pass
+    return code
+
+
+# ---------------------------------------------------------------- context / status
+
+def git(cwd, *args):
+    try:
+        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"(git failed: {e})"
+    return (r.stdout or r.stderr).rstrip()
+
+
+def cmd_context(args, rex=None, host=None, out=print):
+    rex, host = rex or Rex(), host or Host()
+    try:
+        records = rex.status(args.session, args.block)
+    except RexError as e:
+        print(f"pi-shepherd: {e}", file=sys.stderr)
+        return EXIT["ERROR"]
+    if not records:
+        print("pi-shepherd: no status records for this block (Pi not running)", file=sys.stderr)
+        return EXIT["GONE"]
+    record = records[0]
+    pid = (record.get("owner") or {}).get("pid")
+    try:
+        cwd, directory = host.cwd(pid), host.session_dir(pid)
+    except (OSError, TypeError):
+        cwd, directory = "", None
+    log = read_log(directory, deep=True) if directory else None
+    try:
+        model, thinking = parse_footer(rex.capture(args.session, args.block))
+    except RexError:
+        model, thinking = "", ""
+    md = [f"# Pi context {args.session} {args.block}",
+          f"state: {record.get('state')} · model: {model or '?'} · thinking: {thinking or '?'}",
+          f"worktree: {cwd or '?'}", ""]
+    error = log.last_error if log else None
+    if error:
+        provider = "/".join(p for p in (error["provider"], error["model"]) if p)
+        stale = bool(log.settled) and error["id"] != log.settled["id"]
+        note = ", earlier than the last assistant message" if stale else ""
+        md += [f"## Last error ({error['timestamp']}, {provider}{note})", error["error"], ""]
+    elif record.get("state") == STATE_ERROR:
+        md += ["## Last error", record.get("message", ""), ""]
+    md += ["## Last assistant message", (log.text if log else "") or "(none in the session log)", ""]
+    if cwd:
+        md += ["## git status -sb", git(cwd, "status", "-sb"), "", "## git log --oneline -5",
+               git(cwd, "log", "--oneline", "-5"), ""]
+    text = "\n".join(md).rstrip() + "\n"
+    path = os.path.join(out_dir(), f"context-{block_key(args.session, args.block)}-{int(time.time())}.md")
+    try:
+        write_private(path, text)
+    except FileError as e:
+        print(f"pi-shepherd: {e}", file=sys.stderr)
+        return EXIT["ERROR"]
+    out(text + f"\nsaved: {path}")
+    return 0
+
+
+def cmd_status(args, rex=None, host=None, out=print):
+    rex, host = rex or Rex(), host or Host()
+    try:
+        sessions = [(sid, label) for sid, label in rex.sessions()
+                    if not args.session or args.session in (sid, label)]
+    except RexError as e:
+        print(f"pi-shepherd: {e}", file=sys.stderr)
+        return EXIT["ERROR"]
+    for sid, _label in sessions:
+        try:
+            windows, blocks = rex.windows(sid), rex.blocks(sid)
+        except RexError:
+            continue
+        for b in blocks:
+            bid = b.get("block_id")
+            try:
+                records = rex.status(sid, bid)
+            except RexError:
+                continue
+            records = [r for r in records if r.get("app", PI_APP) == PI_APP]
+            if not records:
+                continue
+            record = records[0]
+            try:
+                model, thinking = parse_footer(rex.capture(sid, bid))
+            except RexError:
+                model, thinking = "", ""
+            key = block_key(sid, bid)
+            last = (load_state(key).get("last_event") or {}).get("name", "none")
+            try:
+                with open(os.path.join(state_dir(), key + ".pid")) as f:
+                    pid = int(f.read().strip())
+                wait = str(pid) if alive_wait(pid, sid, bid) else "none"
+            except (OSError, ValueError):
+                wait = "none"
+            label = windows.get(b.get("window_id")) or b.get("label", "")
+            out(f"[{label}] {sid} {bid} state={record.get('state')} model={model or '?'}"
+                f"{' ' + thinking if thinking else ''} last={last} wait={wait}")
+    return 0
+
+
+# ---------------------------------------------------------------- CLI
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(EXIT_USAGE)
+
+
+def build_parser():
+    p = Parser(prog="pi-shepherd", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+
+    w = sub.add_parser("wait", help="block until the first actionable event")
+    w.add_argument("session")
+    w.add_argument("block")
+    w.add_argument("--timeout", type=parse_duration, default=parse_duration("1h"))
+    w.add_argument("--stall", type=parse_duration, default=parse_duration("15m"),
+                   help="working with no log or screen change for this long is STALLED (0 disables)")
+    w.add_argument("--poll", type=parse_duration, default=20, help="poll interval (default 20s)")
+
+    c = sub.add_parser("context", help="save and print the last assistant message, error and git state")
+    c.add_argument("session")
+    c.add_argument("block")
+
+    s = sub.add_parser("status", help="one line per Pi block; changes no state")
+    s.add_argument("session", nargs="?")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return {"wait": cmd_wait, "context": cmd_context, "status": cmd_status}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

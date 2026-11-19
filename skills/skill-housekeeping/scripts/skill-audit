@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""skill-audit: measure a skill and check its links before and after a cleanup.
+
+No LLM, stdlib only.
+
+  skill-audit measure <skill-dir> [--top 15]
+  skill-audit refs    <skill-dir> [--roots DIR ...]
+  skill-audit links   <skill-dir> [--roots DIR ...]
+  skill-audit wrap    <skill-dir> <out-dir> [--width 1400]
+
+measure  Size per file and per section, long lines and size warnings.
+refs     Every line in other skills that names this skill, with the files and
+         section titles it cites and whether they still exist.
+links    Problems only: broken links and anchors inside the skill, and broken
+         inbound citations from other skills. Exit 1 when there is a problem.
+wrap     Copy the skill's Markdown with long lines split, so a reader that cuts
+         long lines can read every character.
+
+--roots defaults to $HERMES_HOME/skills plus `skills.external_dirs` from
+$HERMES_HOME/config.yaml.
+"""
+import argparse
+import os
+import re
+import sys
+
+SKILL_MD_SOFT_LIMIT = 8_000      # loaded on every use: keep it a router
+REFERENCE_SOFT_LIMIT = 10_000    # one topic per reference
+HARD_LIMIT = 100_000             # skill_manage refuses larger files
+LONG_LINE = 1_500                # read_file cuts lines near 2000 chars
+HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+FENCE = re.compile(r"^\s*(```|~~~)")
+LINK = re.compile(r"\]\(\s*<?([^)\s>]*)>?(?:\s+\"[^\"]*\")?\s*\)")
+REF_PATH = re.compile(r"(?:references|templates|scripts|assets)/[\w./-]+")
+QUOTED = re.compile(r"[\"“]([^\"”\n]{3,90})[\"”]")
+
+
+# ---------------------------------------------------------------- helpers
+
+def skill_name(skill_dir):
+    path = os.path.join(skill_dir, "SKILL.md")
+    try:
+        with open(path, encoding="utf-8") as f:
+            head = f.read(4000)
+    except OSError:
+        return os.path.basename(os.path.normpath(skill_dir))
+    m = re.search(r"(?m)^name:\s*[\"']?([\w.-]+)", head)
+    return m.group(1) if m else os.path.basename(os.path.normpath(skill_dir))
+
+
+def md_files(skill_dir):
+    out = []
+    for root, dirs, files in os.walk(skill_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith((".", "__")))
+        for name in sorted(files):
+            if name.endswith(".md"):
+                out.append(os.path.join(root, name))
+    return out
+
+
+def read(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def iter_lines_outside_fences(text):
+    """(line number, line) for lines outside fenced code blocks."""
+    in_fence = False
+    for n, line in enumerate(text.split("\n"), 1):
+        if FENCE.match(line):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            yield n, line
+
+
+def slugify(title):
+    """GitHub-style heading anchor."""
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", title.strip().lower())  # [text](url) -> text
+    t = re.sub(r"[^\w\- ]", "", t)  # drops backticks, asterisks and other punctuation
+    return t.replace(" ", "-")
+
+
+def headings(text):
+    """[(level, title, anchor)] with GitHub's -1, -2 suffixes for repeats."""
+    seen, out = {}, []
+    for _, line in iter_lines_outside_fences(text):
+        m = HEADING.match(line)
+        if not m:
+            continue
+        title = m.group(2)
+        base = slugify(title)
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        out.append((len(m.group(1)), title, base if count == 0 else f"{base}-{count}"))
+    return out
+
+
+def body_without_frontmatter(text):
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end != -1:
+            return text[end + 4:]
+    return text
+
+
+def default_roots():
+    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    roots = [os.path.join(home, "skills")]
+    try:
+        cfg = read(os.path.join(home, "config.yaml"))
+    except OSError:
+        return [r for r in roots if os.path.isdir(r)]
+    if re.search(r"(?m)^\s*external_dirs:[ \t]*[^\s#]", cfg):
+        raise ValueError("inline external_dirs is unsupported; pass --roots explicitly")
+    m = re.search(r"(?m)^(\s*)external_dirs:\s*\n((?:\1\s+-\s*.+\n?)+)", cfg)
+    if m:
+        for item in re.findall(r"-\s*[\"']?([^\"'\n#]+?)[\"']?\s*(?:#.*)?$", m.group(2), re.M):
+            roots.append(os.path.expanduser(item.strip()))
+    return [r for r in dict.fromkeys(roots) if os.path.isdir(r)]
+
+
+# ---------------------------------------------------------------- measure
+
+def sections(text):
+    """[(title, chars)] split at level-2 headings; text before the first is '(preamble)'."""
+    out, title, start = [], "(preamble)", 0
+    pos = 0
+    in_fence = False
+    for line in text.split("\n"):
+        if FENCE.match(line):
+            in_fence = not in_fence
+        m = HEADING.match(line) if not in_fence else None
+        if m and len(m.group(1)) == 2:
+            out.append((title, pos - start))
+            title, start = m.group(2), pos
+        pos += len(line) + 1
+    out.append((title, pos - start))
+    return [(t, n) for t, n in out if n > 0]
+
+
+def cmd_measure(args):
+    skill_dir = args.skill
+    files = md_files(skill_dir)
+    if not files:
+        print(f"no Markdown files under {skill_dir}", file=sys.stderr)
+        return 2
+    total = 0
+    warnings = []
+    print(f"skill: {skill_name(skill_dir)}  ({skill_dir})\n")
+    print(f"{'chars':>8} {'~tokens':>8} {'lines':>6} {'maxline':>8} {'long':>5}  file")
+    rows = []
+    for path in files:
+        text = read(path)
+        lines = text.split("\n")
+        long_lines = sum(1 for ln in lines if len(ln) > LONG_LINE)
+        rel = os.path.relpath(path, skill_dir)
+        total += len(text)
+        rows.append((rel, text))
+        print(f"{len(text):>8} {len(text) // 4:>8} {len(lines):>6} {max(map(len, lines)):>8} "
+              f"{long_lines:>5}  {rel}")
+        limit = SKILL_MD_SOFT_LIMIT if rel == "SKILL.md" else REFERENCE_SOFT_LIMIT
+        if len(text) > HARD_LIMIT:
+            warnings.append(f"ERROR {rel}: {len(text)} chars, over the {HARD_LIMIT} skill_manage limit")
+        elif len(text) > limit:
+            warnings.append(f"WARN  {rel}: {len(text)} chars, over the {limit} target")
+        if long_lines:
+            warnings.append(f"WARN  {rel}: {long_lines} lines over {LONG_LINE} chars "
+                            f"(use `wrap` to read them)")
+    print(f"{total:>8} {total // 4:>8}  total")
+
+    ranked = []
+    for rel, text in rows:
+        body = body_without_frontmatter(text) if rel == "SKILL.md" else text
+        ranked += [(n, rel, title) for title, n in sections(body)]
+    ranked.sort(reverse=True)
+    print(f"\nlargest sections (level 2):")
+    for n, rel, title in ranked[: args.top]:
+        print(f"{n:>8}  {rel} → {title}")
+    if warnings:
+        print("\n" + "\n".join(warnings))
+    return 0
+
+
+# ---------------------------------------------------------------- refs / links
+
+def skill_index(skill_dir):
+    """Existing relative file paths and the anchors and titles of each Markdown file."""
+    paths, anchors, titles = set(), {}, set()
+    for root, dirs, files in os.walk(skill_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, skill_dir)
+            paths.add(rel)
+            if name.endswith(".md"):
+                hs = headings(read(full))
+                anchors[rel] = {a for _, _, a in hs}
+                titles |= {t.strip().strip("`*").lower() for _, t, _ in hs}
+    return paths, anchors, titles
+
+
+def title_known(quote, titles):
+    q = quote.strip().lower()
+    return any(q == t or q in t or t in q for t in titles if len(t) >= 3)
+
+
+def inbound(skill_dir, roots):
+    """Lines outside the skill that name it, with each cited path or title checked."""
+    name = skill_name(skill_dir)
+    own = os.path.realpath(skill_dir)
+    paths, anchors, titles = skill_index(skill_dir)
+    pattern = re.compile(rf"(?<![\w-]){re.escape(name)}(?![\w-])")
+    seen, visited_dirs, out = set(), set(), []
+    for root in roots:
+        for dirpath, dirs, files in os.walk(root, followlinks=True):
+            real = os.path.realpath(dirpath)
+            if real in visited_dirs:
+                dirs[:] = []
+                continue
+            visited_dirs.add(real)
+            if real == own or real.startswith(own + os.sep):
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if not d.startswith((".", "__"))]
+            for fname in files:
+                if not fname.endswith(".md"):
+                    continue
+                full = os.path.join(dirpath, fname)
+                key = os.path.realpath(full)
+                if key in seen:
+                    continue
+                seen.add(key)
+                for n, line in enumerate(read(full).split("\n"), 1):
+                    if not pattern.search(line):
+                        continue
+                    cited = []
+                    for target in LINK.findall(line):
+                        if re.match(r"^[a-z][a-z0-9+.-]*:", target, re.I):
+                            continue
+                        file_part, _, anchor = target.partition("#")
+                        dest = os.path.realpath(os.path.join(os.path.dirname(full), file_part))
+                        if dest.startswith(own + os.sep):
+                            rel = os.path.relpath(dest, own)
+                            cited.append(("path", rel, rel in paths))
+                            if anchor and rel in anchors:
+                                cited.append(("anchor", rel + "#" + anchor, anchor in anchors[rel]))
+                    for window in citation_windows(line, pattern):
+                        for p in REF_PATH.findall(window):
+                            p = p.rstrip(".,;:)`'\"").split("#")[0]
+                            cited.append(("path", p, p in paths))
+                        for q in QUOTED.findall(window):
+                            if "/" in q or q.startswith("-"):
+                                continue
+                            cited.append(("title", q, title_known(q, titles)))
+                    out.append((full, n, line.strip(), cited))
+    return out
+
+
+def citation_windows(line, pattern, limit=200):
+    """Text right after each mention of the skill, up to the end of that clause.
+
+    A citation follows the name (`skill` → `references/x.md` → "Title"); paths
+    and quotes elsewhere on the line belong to other skills or to prose."""
+    out = []
+    for m in pattern.finditer(line):
+        rest = line[m.end(): m.end() + limit]
+        # Only immediate arrows, paths or parenthesized titles claim ownership.
+        # Prose such as "and other-skill → ..." is ambiguous: leave it for review.
+        if not re.match(r"^[`'\"]?\s*(?:→|->|(?:references|templates|scripts|assets)/|\(\s*[\"“])", rest):
+            continue
+        stop = re.search(r"[.;:!?](\s|$)|\.$", rest)
+        out.append(rest[: stop.start()] if stop else rest)
+    return out
+
+
+def internal_problems(skill_dir):
+    problems = []
+    _, anchors, _ = skill_index(skill_dir)
+    for path in md_files(skill_dir):
+        rel = os.path.relpath(path, skill_dir)
+        for n, line in iter_lines_outside_fences(read(path)):
+            for target in LINK.findall(line):
+                if not target or re.match(r"^[a-z][a-z0-9+.-]*:", target, re.I):
+                    continue  # empty, http:, mailto:, file:
+                file_part, _, anchor = target.partition("#")
+                if file_part:
+                    dest = os.path.normpath(os.path.join(os.path.dirname(rel), file_part))
+                else:
+                    dest = rel
+                if dest.startswith(".."):
+                    full = os.path.normpath(os.path.join(skill_dir, dest))
+                    if not os.path.exists(full):
+                        problems.append(f"{rel}:{n}: missing file {target}")
+                    continue
+                if not os.path.exists(os.path.join(skill_dir, dest)):
+                    problems.append(f"{rel}:{n}: missing file {target}")
+                elif anchor and dest.endswith(".md") and anchor not in anchors.get(dest, set()):
+                    problems.append(f"{rel}:{n}: missing anchor #{anchor} in {dest}")
+    return problems
+
+
+def cmd_refs(args):
+    roots = args.roots or default_roots()
+    rows = inbound(args.skill, roots)
+    print(f"skill: {skill_name(args.skill)}  roots: {', '.join(roots)}\n")
+    if not rows:
+        print("no inbound references")
+        return 0
+    for full, n, line, cited in rows:
+        print(f"{full}:{n}")
+        print(f"    {line[:220]}{'…' if len(line) > 220 else ''}")
+        for kind, value, ok in cited:
+            print(f"    {'ok     ' if ok else 'MISSING'} {kind}: {value}")
+    return 0
+
+
+def cmd_links(args):
+    roots = args.roots or default_roots()
+    problems = internal_problems(args.skill)
+    for full, n, _, cited in inbound(args.skill, roots):
+        for kind, value, ok in cited:
+            if not ok:
+                level = "inbound" if kind == "path" else "inbound (check)"
+                problems.append(f"{level} {full}:{n}: {kind} '{value}' not found in the skill")
+    for p in problems:
+        print(p)
+    print(f"{len(problems)} problem(s)")
+    return 1 if problems else 0
+
+
+# ---------------------------------------------------------------- wrap
+
+def cmd_wrap(args):
+    source, output = os.path.realpath(args.skill), os.path.realpath(args.out)
+    if args.width < 1:
+        print("skill-audit: --width must be positive", file=sys.stderr)
+        return 2
+    if os.path.commonpath([source, output]) in (source, output):
+        print("skill-audit: wrap source and destination must be separate trees", file=sys.stderr)
+        return 2
+    if os.path.lexists(args.out):
+        print("skill-audit: wrap destination must not exist", file=sys.stderr)
+        return 2
+    files = md_files(args.skill)
+    if not files:
+        print("skill-audit: no Markdown files to wrap", file=sys.stderr)
+        return 2
+    # Create once, exclusively: never overwrite source or a previous reading copy.
+    os.makedirs(args.out, exist_ok=False)
+    count = 0
+    for path in files:
+        rel = os.path.relpath(path, args.skill)
+        out_lines = []
+        for line in read(path).split("\n"):
+            if len(line) > args.width:
+                out_lines += [line[i:i + args.width] for i in range(0, len(line), args.width)]
+            else:
+                out_lines.append(line)
+        dest = os.path.join(args.out, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write("\n".join(out_lines))
+        count += 1
+    print(f"wrote {count} file(s) to {args.out} (lines over {args.width} chars split; read only, never copy back)")
+    return 0
+
+
+# ---------------------------------------------------------------- CLI
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="skill-audit", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    m = sub.add_parser("measure", help="size per file and section")
+    m.add_argument("skill")
+    m.add_argument("--top", type=int, default=15)
+
+    for name, helptext in (("refs", "inbound references"), ("links", "problems only; exit 1 if any")):
+        s = sub.add_parser(name, help=helptext)
+        s.add_argument("skill")
+        s.add_argument("--roots", nargs="+", help="skill directories to scan (default: profile skills + external_dirs)")
+
+    w = sub.add_parser("wrap", help="readable copy with long lines split")
+    w.add_argument("skill")
+    w.add_argument("out")
+    w.add_argument("--width", type=int, default=1400)
+
+    args = p.parse_args(argv)
+    if not os.path.isdir(args.skill):
+        print(f"skill-audit: not a directory: {args.skill}", file=sys.stderr)
+        return 2
+    try:
+        if args.cmd in ("refs", "links"):
+            args.roots = args.roots if args.roots is not None else default_roots()
+            if not args.roots:
+                raise ValueError("no scan roots found; pass --roots explicitly")
+            for root in args.roots:
+                if not os.path.isdir(root):
+                    raise ValueError(f"scan root is not a directory: {root}")
+        return {"measure": cmd_measure, "refs": cmd_refs, "links": cmd_links, "wrap": cmd_wrap}[args.cmd](args)
+    except (ValueError, OSError) as error:
+        print(f"skill-audit: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""pr-shepherd: watch one GitHub pull request and report the first actionable event.
+
+No LLM. A Hermes coordinator session runs `wait` as a background process with
+notify_on_complete, so the session wakes when the process exits.
+
+  pr-shepherd wait    <owner/repo> <pr> [--events ci,review,conflict] [--timeout 2h]
+  pr-shepherd context <owner/repo> <pr> --ci | --reviews
+  pr-shepherd status  <owner/repo> <pr>
+
+Exit codes of `wait`:
+  0 CI_GREEN  1 CI_RED  2 REVIEW  3 TIMEOUT  4 CONFLICT
+  5 MERGED    6 CLOSED  7 ERROR   8 STOPPED  64 usage error
+
+MERGED and CLOSED are always reported, whatever --events says.
+State (cursors) lives in $PR_SHEPHERD_STATE_DIR, else $HERMES_HOME/data/pr-shepherd.
+Stdlib only.
+"""
+import argparse
+import errno
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+EXIT = {"CI_GREEN": 0, "CI_RED": 1, "REVIEW": 2, "TIMEOUT": 3, "CONFLICT": 4,
+        "MERGED": 5, "CLOSED": 6, "ERROR": 7, "STOPPED": 8}
+EVENT_KINDS = ("ci", "review", "conflict")
+RED_CONCLUSIONS = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+RED_STATES = {"FAILURE", "ERROR"}
+PENDING_STATES = {"PENDING", "EXPECTED"}
+# Real escape bytes and the literal caret form (`^[[32m`) that GitHub job logs contain.
+ANSI = re.compile(r"(?:\x1b|\^\[)\[[0-9;]*[A-Za-z]")
+TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z ?")
+# No bare "Error:": passing test suites log thousands of expected errors and stacks.
+LOG_SIGNAL = re.compile(r" FAIL |Test Files|AssertionError|error TS\d+|✗|Traceback|panicked|\bFAILED\b")
+ACTIONS_URL = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
+GH_FAILURE_LIMIT = 10
+ACTIONS_MIN_AGE = 60  # seconds a head must be known before CI_GREEN, even with Actions checks
+PR_FIELDS = "number,url,title,author,state,isDraft,mergeable,headRefOid,statusCheckRollup"
+
+
+# ---------------------------------------------------------------- utilities
+
+def parse_duration(text):
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd]?)\s*", str(text))
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad duration: {text!r} (use 90, 90s, 30m, 2h, 1d)")
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def parse_events(text):
+    kinds = [k.strip() for k in text.split(",") if k.strip()]
+    bad = [k for k in kinds if k not in EVENT_KINDS]
+    if bad or not kinds:
+        raise argparse.ArgumentTypeError(f"--events takes a comma list of {','.join(EVENT_KINDS)}")
+    return set(kinds)
+
+
+def first_line(text, limit=160):
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def state_dir():
+    base = os.environ.get("PR_SHEPHERD_STATE_DIR")
+    if not base:
+        home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        base = os.path.join(home, "data", "pr-shepherd")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def out_dir():
+    base = os.environ.get("TMPDIR") or os.path.join(
+        os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"), "cache", "scratch")
+    path = os.path.join(base, "pr-shepherd")
+    private_dir(path)
+    return path
+
+
+class FileError(RuntimeError):
+    pass
+
+
+def private_dir(path):
+    """Create `path` with mode 0700; tighten an existing one that we own and others can use."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.stat(path)
+    if st.st_uid == os.getuid() and st.st_mode & 0o077:
+        os.chmod(path, 0o700)
+
+
+def write_private(path, text):
+    """Write `text` to `path` with mode 0600, refusing to follow a symlink at `path`."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as e:
+        reason = "it is a symlink" if e.errno == errno.ELOOP else e.strerror
+        raise FileError(f"cannot write {path}: {reason}") from e
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)  # an older file may have had wider permissions
+        f.write(text)
+
+
+def pr_key(repo, pr):
+    return f"{repo.replace('/', '__')}__{pr}"
+
+
+def load_state(repo, pr):
+    path = os.path.join(state_dir(), pr_key(repo, pr) + ".json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(repo, pr, state):
+    path = os.path.join(state_dir(), pr_key(repo, pr) + ".json")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".state-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+class GhError(RuntimeError):
+    pass
+
+
+class Gh:
+    """Thin wrapper over the gh CLI. Tests replace it with a fake."""
+
+    def run(self, *args, timeout=120):
+        r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            raise GhError(first_line(r.stderr or r.stdout, 300) or f"gh exited {r.returncode}")
+        return r.stdout
+
+    def pr(self, repo, pr):
+        return json.loads(self.run("pr", "view", str(pr), "--repo", repo, "--json", PR_FIELDS))
+
+    def _lines(self, path):
+        out = self.run("api", "--paginate", path, "--jq", ".[] | tojson")
+        return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+    def reviews(self, repo, pr):
+        return self._lines(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")
+
+    def review_comments(self, repo, pr):
+        return self._lines(f"repos/{repo}/pulls/{pr}/comments?per_page=100")
+
+    def issue_comments(self, repo, pr):
+        return self._lines(f"repos/{repo}/issues/{pr}/comments?per_page=100")
+
+    def threads(self, repo, pr):
+        owner, name = repo.split("/", 1)
+        query = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){
+          pullRequest(number:$number){reviewThreads(first:100){nodes{id isResolved isOutdated path line
+          originalLine comments(first:30){nodes{databaseId author{login} body url createdAt}}}}}}}"""
+        out = self.run("api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
+                       "-f", f"name={name}", "-F", f"number={pr}")
+        return json.loads(out)["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+
+    def failed_log(self, repo, run_id, job_id):
+        return self.run("run", "view", str(run_id), "--repo", repo, "--job", str(job_id),
+                        "--log-failed", timeout=300)
+
+
+# ---------------------------------------------------------------- CI logic
+
+def normalize_checks(rollup):
+    """Rollup entries -> one dict per check, keeping only the latest attempt of a job."""
+    latest = {}
+    for c in rollup or []:
+        if c.get("__typename") == "StatusContext":
+            state = (c.get("state") or "").upper()
+            status = "red" if state in RED_STATES else "pending" if state in PENDING_STATES else "ok"
+            key = f"status:{c.get('context')}"
+            item = {"key": key, "name": c.get("context") or "?", "kind": "status", "status": status,
+                    "conclusion": state, "url": c.get("targetUrl") or "", "order": ""}
+        else:
+            url = c.get("detailsUrl") or ""
+            m = ACTIONS_URL.search(url)
+            run_id, job_id = (m.group(1), m.group(2)) if m else (None, None)
+            conclusion = (c.get("conclusion") or "").upper()
+            if (c.get("status") or "").upper() != "COMPLETED":
+                status = "pending"
+            elif conclusion in RED_CONCLUSIONS:
+                status = "red"
+            else:
+                status = "ok"
+            name = c.get("name") or "?"
+            workflow = c.get("workflowName") or ""
+            # Keyed by workflow and job name, not run: a re-run or a new run of the same job on
+            # the same head replaces the older result, as in GitHub's checks view.
+            item = {"key": f"check:{workflow}:{name}", "name": name, "kind":
+                    "actions" if m else "check", "status": status, "conclusion": conclusion or
+                    (c.get("status") or "").upper(), "url": url, "run_id": run_id, "job_id": job_id,
+                    "workflow": workflow, "order": c.get("startedAt") or c.get("completedAt") or ""}
+        prev = latest.get(item["key"])
+        if prev is None or item["order"] >= prev["order"]:
+            latest[item["key"]] = item
+    return list(latest.values())
+
+
+def ci_counts(checks):
+    by = {"pending": [], "red": [], "ok": []}
+    for c in checks:
+        by[c["status"]].append(c)
+    skipped = [c for c in by["ok"] if c["conclusion"] in ("SKIPPED", "NEUTRAL", "STALE")]
+    return by, skipped
+
+
+def red_key(head, red):
+    return head + "|" + ",".join(sorted(c["url"] or c["key"] for c in red))
+
+
+def evaluate_ci(checks, head, head_age, quiet_period, state):
+    """Return ("CI_RED"|"CI_GREEN", cursor_key) once CI on `head` has settled, else None."""
+    by, _ = ci_counts(checks)
+    if by["pending"]:
+        return None
+    if by["red"]:
+        key = red_key(head, by["red"])
+        return None if key in state.get("reported_red", []) else ("CI_RED", key)
+    has_actions = any(c["kind"] == "actions" for c in checks)
+    # Right after a push only some checks are registered: external statuses first, then each
+    # workflow. Wait a short floor with Actions present, the full quiet period without.
+    if head_age < (ACTIONS_MIN_AGE if has_actions else quiet_period):
+        return None
+    return None if head in state.get("reported_green", []) else ("CI_GREEN", head)
+
+
+# ---------------------------------------------------------------- review logic
+
+def review_items(reviews, review_comments, issue_comments, own_prefix, skip_logins=()):
+    """Feedback items a coordinator must look at. IDs are stable across polls.
+
+    `skip_logins` are accounts whose comments are never feedback: by default the PR author,
+    because the coordinator and its coding agent post through that same account."""
+    items = []
+
+    def own(body, login=None):
+        return login in skip_logins or bool(own_prefix and (body or "").lstrip().startswith(own_prefix))
+
+    for r in reviews:
+        state, body = (r.get("state") or "").upper(), r.get("body") or ""
+        login = (r.get("user") or {}).get("login", "?")
+        if own(body, login) or state in ("PENDING", "DISMISSED"):
+            continue
+        if state == "COMMENTED" and not body.strip():
+            continue  # container of inline comments; those are reported one by one
+        items.append({"id": f"review:{r['id']}", "kind": f"review {state}", "author": login,
+                      "body": body, "url": r.get("html_url", ""),
+                      "where": ""})
+    for c in review_comments:
+        body = c.get("body") or ""
+        login = (c.get("user") or {}).get("login", "?")
+        if own(body, login):
+            continue
+        line = c.get("line") or c.get("original_line") or ""
+        items.append({"id": f"inline:{c['id']}", "kind": "inline comment", "author": login,
+                      "body": body, "url": c.get("html_url", ""),
+                      "where": f"{c.get('path', '?')}:{line}"})
+    for c in issue_comments:
+        body, login = c.get("body") or "", (c.get("user") or {}).get("login", "?")
+        if own(body, login) or login.endswith("[bot]") or body.lstrip().startswith("/"):
+            continue  # bot status comments and chatops commands are not feedback
+        items.append({"id": f"comment:{c['id']}", "kind": "comment", "author": login, "body": body,
+                      "url": c.get("html_url", ""), "where": ""})
+    return items
+
+
+def skip_logins(info, include_author):
+    author = (info.get("author") or {}).get("login")
+    return set() if include_author or not author else {author}
+
+
+def fetch_review_items(gh, repo, pr, args, info):
+    return review_items(gh.reviews(repo, pr), gh.review_comments(repo, pr),
+                        gh.issue_comments(repo, pr), args.own_prefix,
+                        skip_logins(info, getattr(args, "include_author", False)))
+
+
+# ---------------------------------------------------------------- output
+
+def format_checks(cs, limit=8):
+    names = [f"{c['name']} [{c['conclusion']}]" for c in cs[:limit]]
+    return ", ".join(names) + (f" (+{len(cs) - limit} more)" if len(cs) > limit else "")
+
+
+def event_block(event, repo, pr, info, detail, extra=None):
+    lines = [f"EVENT {event} {repo}#{pr} head={(info.get('headRefOid') or '?')[:10]}",
+             f"pr: {info.get('url', '')} · {first_line(info.get('title'), 100)}"]
+    lines += detail
+    if extra:
+        lines += extra
+    return "\n".join(lines)
+
+
+def ci_detail(checks):
+    by, skipped = ci_counts(checks)
+    detail = [f"checks: {len(by['ok']) - len(skipped)} passed · {len(skipped)} skipped · "
+              f"{len(by['red'])} failed · {len(by['pending'])} pending"]
+    if by["red"]:
+        detail.append("failed:")
+        detail += [f"- {c['name']} [{c['conclusion']}] {c['url']}" for c in by["red"]]
+    if skipped:
+        detail.append("skipped: " + ", ".join(sorted({c["name"] for c in skipped})))
+    return detail
+
+
+# ---------------------------------------------------------------- wait
+
+class Stopped(Exception):
+    pass
+
+
+def _alive_wait(pid, repo, pr):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except OSError:
+        return False
+    text = [a.decode(errors="replace") for a in argv]
+    return any(a.endswith("pr-shepherd") for a in text) and "wait" in text and repo in text and str(pr) in text
+
+
+def replace_previous_wait(repo, pr, out):
+    """One wait per PR: stop an older wait for the same PR, then record this one."""
+    pidfile = os.path.join(state_dir(), pr_key(repo, pr) + ".pid")
+    try:
+        old = int(open(pidfile).read().strip())
+    except (OSError, ValueError):
+        old = None
+    if old and old != os.getpid() and _alive_wait(old, repo, pr):
+        os.kill(old, signal.SIGTERM)
+        for _ in range(50):
+            if not _alive_wait(old, repo, pr):
+                break
+            time.sleep(0.1)
+        out(f"replaced previous wait pid={old}")
+    with open(pidfile, "w") as f:
+        f.write(str(os.getpid()))
+    return pidfile
+
+
+def run_wait(args, gh=None, clock=time.time, sleep=time.sleep, out=print):
+    gh = gh or Gh()
+    repo, pr = args.repo, args.pr
+    events = args.events
+    state = load_state(repo, pr)
+    deadline = clock() + args.timeout
+    failures, last_error = 0, ""
+    review_first_new = None
+    info = {}
+
+    def finish(event, detail, extra=None):
+        out(event_block(event, repo, pr, info, detail, extra))
+        return EXIT[event]
+
+    while True:
+        try:
+            info = gh.pr(repo, pr)
+            items = fetch_review_items(gh, repo, pr, args, info) if "review" in events else []
+            failures = 0
+        except (GhError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
+            failures, last_error = failures + 1, str(e)
+            if failures >= GH_FAILURE_LIMIT:
+                return finish("ERROR", [f"gh failed {failures} times in a row: {last_error}"])
+            if clock() >= deadline:
+                return finish("TIMEOUT", [f"last gh error: {last_error}"])
+            sleep(args.interval)
+            continue
+
+        head = info.get("headRefOid") or ""
+        now = clock()
+        first_seen = state.setdefault("head_first_seen", {})
+        first_seen.setdefault(head, now)
+        if "review" in events and "seen" not in state:  # first review wait: existing feedback is the baseline
+            state["seen"] = sorted(i["id"] for i in items)
+            if items:
+                out(f"baseline: {len(items)} existing review items marked as seen "
+                    f"(inspect with: pr-shepherd context {repo} {pr} --reviews)")
+        save_state(repo, pr, state)
+
+        pr_state = (info.get("state") or "").upper()
+        if pr_state in ("MERGED", "CLOSED"):
+            return finish(pr_state, [f"state: {pr_state}"])
+
+        new_items = [i for i in items if i["id"] not in set(state.get("seen", []))]
+        pending_note = [f"also pending: {len(new_items)} new review items (next wait reports them)"] \
+            if new_items else None
+
+        if "conflict" in events and (info.get("mergeable") or "").upper() == "CONFLICTING" \
+                and head not in state.get("reported_conflict", []):
+            state.setdefault("reported_conflict", []).append(head)
+            save_state(repo, pr, state)
+            return finish("CONFLICT", ["mergeable: CONFLICTING (GitHub starts no CI until it is resolved)"],
+                          pending_note)
+
+        if "ci" in events:
+            checks = normalize_checks(info.get("statusCheckRollup"))
+            verdict = evaluate_ci(checks, head, now - first_seen[head], args.quiet_period, state)
+            if verdict:
+                event, key = verdict
+                state.setdefault("reported_red" if event == "CI_RED" else "reported_green", []).append(key)
+                save_state(repo, pr, state)
+                hint = [f"next: pr-shepherd context {repo} {pr} --ci"] if event == "CI_RED" else []
+                return finish(event, ci_detail(checks) + hint, pending_note)
+
+        if new_items:
+            review_first_new = review_first_new or now
+            if now - review_first_new >= args.settle or now >= deadline:
+                state["seen"] = sorted(set(state["seen"]) | {i["id"] for i in new_items})
+                save_state(repo, pr, state)
+                detail = [f"new feedback ({len(new_items)}):"]
+                for i in new_items:
+                    where = f" on {i['where']}" if i["where"] else ""
+                    detail.append(f"- {i['kind']} by {i['author']}{where}: {first_line(i['body'], 140)} {i['url']}")
+                detail.append(f"next: pr-shepherd context {repo} {pr} --reviews")
+                return finish("REVIEW", detail)
+        else:
+            review_first_new = None
+
+        if now >= deadline:
+            checks = normalize_checks(info.get("statusCheckRollup"))
+            return finish("TIMEOUT", [f"no event in {args.timeout}s; the PR may still need attention"]
+                          + ci_detail(checks))
+        sleep(args.interval)
+
+
+def cmd_wait(args):
+    pidfile = replace_previous_wait(args.repo, args.pr, print)
+
+    def on_signal(signum, _frame):
+        raise Stopped(signal.Signals(signum).name)
+
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, on_signal)
+    print(f"watching {args.repo}#{args.pr} events={','.join(sorted(args.events))} "
+          f"timeout={args.timeout}s pid={os.getpid()}", flush=True)
+    try:
+        code = run_wait(args)
+    except Stopped as e:
+        print(f"EVENT STOPPED {args.repo}#{args.pr} by {e} (replaced by a newer wait or killed)")
+        code = EXIT["STOPPED"]
+    finally:
+        try:
+            if open(pidfile).read().strip() == str(os.getpid()):
+                os.remove(pidfile)
+        except OSError:
+            pass
+    sys.stdout.flush()
+    return code
+
+
+# ---------------------------------------------------------------- context / status
+
+def log_messages(text):
+    """`gh run view --log-failed` lines -> messages without job/step/timestamp prefixes or step setup blocks."""
+    msgs, in_group = [], False
+    for ln in text.splitlines():
+        msg = TIMESTAMP.sub("", ANSI.sub("", ln.split("\t")[-1]).lstrip("\ufeff")).rstrip()
+        if msg.startswith("##[group]"):
+            in_group = True
+            continue
+        if msg.startswith("##[endgroup]"):
+            in_group = False
+            continue
+        if not in_group and msg.strip():
+            msgs.append(msg)
+    return msgs
+
+
+def log_excerpt(text, limit=80, before=30):
+    """The output leading up to each ##[error] plus signal lines; falls back to the tail.
+
+    Keeps the last `limit` lines: the failure summary is at the end of a job log."""
+    msgs = log_messages(text)
+    picked = set()
+    for i, msg in enumerate(msgs):
+        if msg.startswith("##[error]"):
+            picked.update(range(max(0, i - before), i + 1))
+        elif LOG_SIGNAL.search(msg):
+            picked.add(i)
+    if not picked:
+        picked = set(range(max(0, len(msgs) - 40), len(msgs)))
+    return [msgs[i] for i in sorted(picked)][-limit:]
+
+
+def cmd_context(args, gh=None):
+    gh = gh or Gh()
+    repo, pr = args.repo, args.pr
+    info = gh.pr(repo, pr)
+    head = (info.get("headRefOid") or "")[:10]
+    md = [f"# {repo}#{pr} · head {head}", f"{info.get('url', '')} · {info.get('title', '')}", ""]
+    if args.ci:
+        checks = normalize_checks(info.get("statusCheckRollup"))
+        md += ci_detail(checks) + [""]
+        for c in [c for c in checks if c["status"] == "red"]:
+            md.append(f"## {c['name']} [{c['conclusion']}]")
+            md.append(c["url"])
+            if c["kind"] == "actions" and c["conclusion"] != "CANCELLED":
+                try:
+                    log = gh.failed_log(repo, c["run_id"], c["job_id"])
+                except (GhError, subprocess.TimeoutExpired) as e:
+                    md += [f"(log unavailable: {e})", ""]
+                    continue
+                path = os.path.join(out_dir(), f"{pr_key(repo, pr)}-{head}-job{c['job_id']}.log")
+                write_private(path, ANSI.sub("", log))
+                md += [f"full log: {path}", "```"] + log_excerpt(log) + ["```", ""]
+            else:
+                md += ["(no Actions log: cancelled job or external check; open the URL)", ""]
+        name = "ci"
+    else:
+        skip = skip_logins(info, args.include_author)
+        threads = [t for t in gh.threads(repo, pr) if not t.get("isResolved")]
+        md.append(f"## Unresolved review threads ({len(threads)})")
+        for t in threads:
+            line = t.get("line") or t.get("originalLine") or "?"
+            outdated = " (outdated)" if t.get("isOutdated") else ""
+            comments = (t.get("comments") or {}).get("nodes", [])
+            last = comments[-1] if comments else {}
+            answered = " · answered by us" if ((last.get("author") or {}).get("login") in skip or (
+                args.own_prefix and (last.get("body") or "").lstrip().startswith(args.own_prefix))) else ""
+            md.append(f"### {t.get('path')}:{line}{outdated}{answered} · thread {t.get('id')}")
+            for c in comments:
+                author = (c.get("author") or {}).get("login", "?")
+                md.append(f"- **{author}** (comment {c.get('databaseId')}, {c.get('url')}):")
+                md += ["  " + ln for ln in (c.get("body") or "").strip()[:3000].splitlines()]
+            md.append("")
+        others = [i for i in fetch_review_items(gh, repo, pr, args, info) if not i["id"].startswith("inline:")]
+        md.append(f"## Review summaries and conversation ({len(others)})")
+        for i in others:
+            md.append(f"- **{i['author']}** · {i['kind']} · {i['url']}")
+            md += ["  " + ln for ln in i["body"].strip()[:3000].splitlines()]
+        name = "reviews"
+    text = "\n".join(md).rstrip() + "\n"
+    path = os.path.join(out_dir(), f"{pr_key(repo, pr)}-{head}-{name}.md")
+    write_private(path, text)
+    print(text + f"\nsaved: {path}")
+    return 0
+
+
+def cmd_status(args, gh=None):
+    gh = gh or Gh()
+    info = gh.pr(args.repo, args.pr)
+    checks = normalize_checks(info.get("statusCheckRollup"))
+    state = load_state(args.repo, args.pr)
+    items = fetch_review_items(gh, args.repo, args.pr, args, info)
+    unseen = [i for i in items if i["id"] not in set(state.get("seen", []))] if "seen" in state else []
+    pidfile = os.path.join(state_dir(), pr_key(args.repo, args.pr) + ".pid")
+    try:
+        pid = int(open(pidfile).read().strip())
+        wait = f"running (pid {pid})" if _alive_wait(pid, args.repo, args.pr) else "none"
+    except (OSError, ValueError):
+        wait = "none"
+    print(f"{args.repo}#{args.pr} {info.get('state')} draft={info.get('isDraft')} "
+          f"mergeable={info.get('mergeable')} head={(info.get('headRefOid') or '')[:10]}")
+    print("\n".join(ci_detail(checks)))
+    print(f"review items: {len(items)} total · {len(unseen)} not yet reported" if "seen" in state
+          else f"review items: {len(items)} total · no baseline yet")
+    print(f"wait: {wait}")
+    return 0
+
+
+# ---------------------------------------------------------------- CLI
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(64)
+
+
+def build_parser():
+    p = Parser(prog="pr-shepherd", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+
+    def common(sp):
+        sp.add_argument("repo", help="owner/name")
+        sp.add_argument("pr", type=int)
+        sp.add_argument("--own-prefix", default=os.environ.get("PR_SHEPHERD_OWN_PREFIX", "Hermes Agent"),
+                        help="ignore comments whose body starts with this (the coordinator's own replies)")
+        sp.add_argument("--include-author", action="store_true",
+                        help="treat the PR author's comments as feedback (ignored by default: the "
+                             "coordinator and its coding agent post through the author's account)")
+
+    w = sub.add_parser("wait", help="block until the first actionable event")
+    common(w)
+    w.add_argument("--events", type=parse_events, default=set(EVENT_KINDS),
+                   help="comma list of ci,review,conflict (default all; MERGED/CLOSED always end the wait)")
+    w.add_argument("--timeout", type=parse_duration, default=parse_duration("2h"))
+    w.add_argument("--interval", type=parse_duration, default=60, help="poll interval (default 60s)")
+    w.add_argument("--settle", type=parse_duration, default=120,
+                   help="after new feedback appears, wait this long to batch more (default 120s)")
+    w.add_argument("--quiet-period", type=parse_duration, default=180,
+                   help="with no Actions checks yet, wait this long after a new head before CI_GREEN")
+
+    c = sub.add_parser("context", help="print a brief of failing CI or open review feedback")
+    common(c)
+    g = c.add_mutually_exclusive_group(required=True)
+    g.add_argument("--ci", action="store_true")
+    g.add_argument("--reviews", action="store_true")
+
+    s = sub.add_parser("status", help="one-shot status; changes no state")
+    common(s)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if "/" not in args.repo:
+        print("pr-shepherd: repo must be owner/name", file=sys.stderr)
+        return 64
+    try:
+        return {"wait": cmd_wait, "context": cmd_context, "status": cmd_status}[args.cmd](args)
+    except GhError as e:
+        print(f"pr-shepherd: gh failed: {e}", file=sys.stderr)
+        return EXIT["ERROR"]
+    except FileError as e:
+        print(f"pr-shepherd: {e}", file=sys.stderr)
+        return EXIT["ERROR"]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

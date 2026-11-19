@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# Link (or copy) this repo's skills into the skills directories of your agents.
+# Manual alternative to: npx skills add uesteibar/skills
+set -euo pipefail
+
+readonly AGENTS_TARGET="${HOME}/.agents/skills" # read by Pi and Codex
+readonly CLAUDE_TARGET="${HOME}/.claude/skills"
+readonly AGENT_AGENTS=agents AGENT_CLAUDE=claude
+readonly SKILLS_DIR=skills SKILL_FILE=SKILL.md
+readonly MODE_LINK=link MODE_COPY=copy
+readonly V_LINK=link V_COPY=copy V_OK=ok V_SKIP=skip V_REMOVE=remove
+readonly EXIT_CONFLICT=1 EXIT_USAGE=2 EXIT_SAFETY=3
+
+usage() {
+  cat <<'EOF'
+Usage: ./install [options] [skill ...]
+
+Link each skill in skills/ into your agents' skills directories (all skills
+unless names are given).
+
+  --agent agents|claude  target to use; repeat for both (default: both)
+  --dir <path>           install into this one directory instead
+  --copy                 copy skill folders instead of symlinking them
+  --force                replace a link or copy that this repo manages
+  --uninstall            remove only what this repo installed
+  --dry-run              print what would happen; change nothing
+
+Exit codes: 0 success; 1 a skip caused by a conflict; 2 usage error;
+3 safety refusal (a symlinked target, or --dir inside this repo).
+EOF
+}
+
+die() { printf 'error: %s\n' "${*:2}" >&2; exit "$1"; }
+
+# Fully resolved path of $1, or its raw link text when it cannot be resolved.
+resolve() { readlink -f -- "$1" 2>/dev/null || readlink -- "$1"; }
+
+REPO=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
+SRC_ROOT=$(readlink -f -- "$REPO/$SKILLS_DIR")
+
+# Sets WALK_PATH to the physical path of <path> (a missing tail is kept as written) and
+# WALK_LINK to the first symlinked parent directory met on the way, or "".
+walk_path() { # walk_path <path>
+  local path=$1 comp res i n
+  local -a parts
+  WALK_PATH=/ WALK_LINK=""
+  [[ $path == /* ]] || path=$PWD/$path
+  while [[ $path == */ && $path != / ]]; do path=${path%/}; done
+  IFS=/ read -ra parts <<<"$path"
+  n=${#parts[@]}
+  for i in "${!parts[@]}"; do
+    comp=${parts[i]}
+    case $comp in
+      ""|.) ;;
+      ..)   WALK_PATH=$(dirname -- "$WALK_PATH") ;;
+      *)    WALK_PATH=${WALK_PATH%/}/$comp
+            if [[ -L $WALK_PATH ]]; then
+              if ((i < n - 1)) && [[ -z $WALK_LINK ]]; then WALK_LINK=$WALK_PATH; fi
+              if res=$(readlink -f -- "$WALK_PATH" 2>/dev/null); then WALK_PATH=$res; fi
+            fi ;;
+    esac
+  done
+}
+
+MODE=$MODE_LINK FORCE=0 DRY_RUN=0 UNINSTALL=0 DIR=""
+AGENT_ARGS=() NAMES=() TARGETS=() ALL=()
+STATE="" DETAIL="" WALK_PATH="" WALK_LINK=""
+declare -A COUNT=()
+
+while (($#)); do
+  case $1 in
+    --agent)     [[ -n ${2-} ]] || die "$EXIT_USAGE" "--agent needs a value"; AGENT_ARGS+=("$2"); shift ;;
+    --dir)       [[ -n ${2-} ]] || die "$EXIT_USAGE" "--dir needs a path"; DIR=$2; shift ;;
+    --copy)      MODE=$MODE_COPY ;;
+    --force)     FORCE=1 ;;
+    --dry-run)   DRY_RUN=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    -h|--help)   usage; exit 0 ;;
+    -*)          die "$EXIT_USAGE" "unknown option: $1" ;;
+    *)           NAMES+=("$1") ;;
+  esac
+  shift
+done
+
+if [[ -n $DIR ]]; then
+  ((${#AGENT_ARGS[@]} == 0)) || die "$EXIT_USAGE" "--dir and --agent cannot be combined"
+  walk_path "$DIR"
+  if [[ $WALK_PATH == "$REPO" || $WALK_PATH == "$REPO"/* ]]; then
+    die "$EXIT_SAFETY" "refusing to use --dir $DIR: it resolves to $WALK_PATH, inside this repo ($REPO)"
+  fi
+  TARGETS=("$DIR")
+else
+  ((${#AGENT_ARGS[@]})) || AGENT_ARGS=("$AGENT_AGENTS" "$AGENT_CLAUDE")
+  for agent in "${AGENT_ARGS[@]}"; do
+    case $agent in
+      "$AGENT_AGENTS") TARGETS+=("$AGENTS_TARGET") ;;
+      "$AGENT_CLAUDE") TARGETS+=("$CLAUDE_TARGET") ;;
+      *)               die "$EXIT_USAGE" "unknown agent: $agent (use agents or claude)" ;;
+    esac
+  done
+fi
+
+for path in "$SRC_ROOT"/*/; do
+  if [[ -f "${path}$SKILL_FILE" ]]; then ALL+=("$(basename -- "$path")"); fi
+done
+if ((${#NAMES[@]})); then
+  for name in "${NAMES[@]}"; do
+    case $name in
+      *[[:space:]/]*|*..*) die "$EXIT_USAGE" "invalid skill name: $name (a name has no spaces, slashes or ..)" ;;
+    esac
+    known=0
+    for skill in "${ALL[@]}"; do
+      if [[ $skill == "$name" ]]; then known=1; fi
+    done
+    ((known)) || die "$EXIT_USAGE" "unknown skill: $name"
+  done
+else
+  NAMES=("${ALL[@]}")
+fi
+
+# Check every target before changing anything, so a refusal leaves no partial install.
+for target in "${TARGETS[@]}"; do
+  if [[ -L $target ]]; then
+    die "$EXIT_SAFETY" "refusing to write into $target: it is a symlink to $(resolve "$target")"
+  fi
+  if [[ -e $target && ! -d $target ]]; then die "$EXIT_CONFLICT" "$target is not a directory"; fi
+done
+# A symlinked parent is allowed (dotfile setups link ~/.claude on purpose), but say so.
+for target in "${TARGETS[@]}"; do
+  walk_path "$target"
+  if [[ -n $WALK_LINK ]]; then
+    printf 'note: %s is reached through the symlink %s; the destination is %s\n' \
+      "$target" "$WALK_LINK" "$WALK_PATH" >&2
+  fi
+done
+if ((!UNINSTALL && !DRY_RUN)); then
+  for target in "${TARGETS[@]}"; do mkdir -p -- "$target"; done
+fi
+
+act() { ((DRY_RUN)) || "$@"; } # run a mutating command unless --dry-run
+
+report() { # report <verb> <name> <path> [reason]
+  printf '%-7s %s -> %s%s\n' "$1" "$2" "$3" "${4:+ ($4)}"
+  COUNT[$1]=$(( ${COUNT[$1]:-0} + 1 ))
+}
+
+# Sets STATE (and DETAIL for links) for <dest>, compared with the repo folder <src>.
+classify() { # classify <src> <dest>
+  local src=$1 dest=$2 res
+  STATE=absent DETAIL=""
+  if [[ -L $dest ]]; then
+    res=$(resolve "$dest")
+    DETAIL=$res
+    if [[ $res == "$src" ]]; then STATE=link_ok
+    elif [[ $res == "$SRC_ROOT"/* ]]; then STATE=link_managed
+    else STATE=link_foreign; fi
+  elif [[ -d $dest ]]; then
+    if diff -rq -- "$src" "$dest" >/dev/null; then STATE=copy_ok; else STATE=dir_other; fi
+  elif [[ -e $dest ]]; then
+    STATE=file
+  fi
+}
+
+place() { # place <name> <src> <dest>
+  if [[ $MODE == "$MODE_COPY" ]]; then
+    act cp -R -- "$2" "$3"; report "$V_COPY" "$1" "$3"
+  else
+    act ln -s -- "$2" "$3"; report "$V_LINK" "$1" "$3"
+  fi
+}
+
+# Removes a symlink, or a folder that classify has already matched to the repo.
+remove_managed() {
+  if [[ -L $1 ]]; then act rm -- "$1"; else act rm -rf -- "$1"; fi
+}
+
+install_one() { # install_one <name> <target>
+  local name=$1 src="$SRC_ROOT/$1" dest="$2/$1"
+  classify "$src" "$dest"
+  case "$STATE:$MODE" in
+    absent:*)                              place "$name" "$src" "$dest" ;;
+    link_ok:$MODE_LINK|copy_ok:$MODE_COPY) report "$V_OK" "$name" "$dest" ;;
+    link_foreign:*)                        report "$V_SKIP" "$name" "$dest" "points to $DETAIL, not this repo" ;;
+    dir_other:*)                           report "$V_SKIP" "$name" "$dest" "folder with different contents" ;;
+    file:*)                                report "$V_SKIP" "$name" "$dest" "a file is in the way" ;;
+    *)
+      if ((FORCE)); then
+        remove_managed "$dest"; place "$name" "$src" "$dest"
+      else
+        report "$V_SKIP" "$name" "$dest" "installed in another form; --force replaces it"
+      fi ;;
+  esac
+}
+
+uninstall_one() { # uninstall_one <name> <target>
+  local name=$1 src="$SRC_ROOT/$1" dest="$2/$1"
+  classify "$src" "$dest"
+  case $STATE in
+    absent)        report "$V_OK" "$name" "$dest" "not installed" ;;
+    link_ok)
+      # Only the exact link this installer creates; a chain of links is not ours.
+      if [[ $(readlink -- "$dest") == "$src" ]]; then
+        remove_managed "$dest"; report "$V_REMOVE" "$name" "$dest"
+      else
+        report "$V_SKIP" "$name" "$dest" "not a direct link to $src"
+      fi ;;
+    copy_ok)       remove_managed "$dest"; report "$V_REMOVE" "$name" "$dest" ;;
+    link_managed)  report "$V_SKIP" "$name" "$dest" "points to $DETAIL, a different skill of this repo" ;;
+    link_foreign)  report "$V_SKIP" "$name" "$dest" "not a link to this repo" ;;
+    dir_other)     report "$V_SKIP" "$name" "$dest" "modified copy, kept" ;;
+    file)          report "$V_SKIP" "$name" "$dest" "not a link or copy" ;;
+  esac
+}
+
+for target in "${TARGETS[@]}"; do
+  for name in "${NAMES[@]}"; do
+    if ((UNINSTALL)); then uninstall_one "$name" "$target"; else install_one "$name" "$target"; fi
+  done
+done
+
+label=summary
+if ((DRY_RUN)); then label="dry run, nothing changed"; fi
+printf '%s: %d linked, %d copied, %d ok, %d skipped, %d removed\n' "$label" \
+  "${COUNT[$V_LINK]:-0}" "${COUNT[$V_COPY]:-0}" "${COUNT[$V_OK]:-0}" \
+  "${COUNT[$V_SKIP]:-0}" "${COUNT[$V_REMOVE]:-0}"
+
+if ((${COUNT[$V_SKIP]:-0})); then exit "$EXIT_CONFLICT"; fi
+exit 0

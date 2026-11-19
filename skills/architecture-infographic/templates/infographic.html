@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Infographic</title>
+<!--
+  Visual explainer template (skill: architecture-infographic).
+  Edit the DOC object only. DOC.sections is an ordered list; keep, reorder or
+  delete sections freely. Any value may be a plain value or a function of the
+  selected scenario id: (s) => ...
+  Open with #<scenarioId> to preselect a scenario (used by render.sh).
+
+  Section types:
+    steps    left-to-right stages with chips (pipelines, request paths, processes)
+    journey  vertical timeline, one or two lanes (user flows, sequences, actor vs system)
+    screens  row of simple screen frames (UI flows)
+    layers   stacked bands with parts (layered architecture, deployment, ownership)
+    branch   1 -> N -> M tree (fan-out, split, routing); also embeddable in a step
+    records  data cards with example rows (tables, events, files, caches, messages)
+    points   icon cards, any count (guarantees, invariants, trade-offs, rules)
+    changes  dashed accent box for what is proposed vs what exists today
+
+  Shared item options: color (c1..c5), isNew (dashed accent + "new" tag),
+  dimIn: [scenario ids] (fades the item), show: s => bool (hides the item).
+  Inline text tags: <ok>…</ok> <wait>…</wait> <off>…</off> <new>…</new>.
+  Status pills: [label, ok|wait|off|new|info].
+-->
+<style>
+  :root{
+    --bg:#f5f6f8; --card:#fff; --ink:#151821; --mute:#6b7280; --line:#e3e6eb;
+    --c1:#2f6fed; --c1s:#e8f0fe; --c2:#7c4dff; --c2s:#f0ebff;
+    --c3:#f08c00; --c3s:#fff3e0; --c4:#16a34a; --c4s:#e7f7ed;
+    --c5:#0891b2; --c5s:#e0f5fa;
+    --skip:#9ca3af; --skips:#f1f2f4; --new:#e11d74; --news:#fde8f1;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0e1116; --card:#171b22; --ink:#eef1f5; --mute:#9aa3ae; --line:#2a303a;
+      --c1s:#16233f; --c2s:#231a3f; --c3s:#33240d; --c4s:#0f2a1a; --c5s:#0c2a31; --skip:#6b7280; --skips:#22262d; --new:#f0529a; --news:#3a1426; }
+  }
+  *{box-sizing:border-box}
+  html{background:var(--bg)}
+  body{margin:0;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",sans-serif}
+  code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
+  .page{max-width:1240px;margin:0 auto;padding:40px 36px 64px}
+  .kicker{font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mute)}
+  h1{font-size:40px;line-height:1.1;margin:6px 0 10px;letter-spacing:-.02em}
+  .lede{font-size:19px;color:var(--mute);max-width:760px;margin:0}
+  section{margin-top:44px}
+  h2{font-size:13px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--mute);margin:0 0 14px}
+  .note{font-size:14px;color:var(--mute);margin:-8px 0 14px}
+  .isnew{border-color:var(--new) !important;border-style:dashed !important}
+  .newtag{display:inline-block;background:var(--news);color:var(--new);font-weight:800;font-size:11px;letter-spacing:.08em;text-transform:uppercase;border-radius:999px;padding:2px 8px;vertical-align:middle}
+
+  .switch{display:inline-flex;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:4px;margin-top:22px;flex-wrap:wrap}
+  .switch button{border:0;background:transparent;color:var(--ink);font:inherit;font-size:14px;font-weight:600;padding:8px 16px;border-radius:999px;cursor:pointer}
+  .switch button.on{background:var(--ink);color:var(--bg)}
+
+  .status{display:inline-block;font-size:12px;font-weight:700;border-radius:999px;padding:2px 9px;white-space:nowrap}
+  .st-ok{background:var(--c4);color:#fff} .st-wait{background:var(--c3);color:#fff} .st-info{background:var(--c1);color:#fff}
+  .st-off{background:var(--skips);color:var(--skip);border:1px solid var(--line)}
+  .st-new{background:var(--news);color:var(--new);border:1px dashed var(--new)}
+  .hl-ok{background:var(--c4s);border-radius:4px;padding:0 4px}
+  .hl-wait{background:var(--c3s);border-radius:4px;padding:0 4px}
+  .hl-off{color:var(--skip)}
+  .hl-new{background:var(--news);color:var(--new);border-radius:4px;padding:0 4px}
+  .arrow{display:grid;place-items:center;color:var(--mute);font-size:26px;font-weight:300}
+
+  /* steps */
+  .flow{display:grid;align-items:stretch}
+  .stage{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:22px 20px;display:flex;flex-direction:column;gap:12px;border-top:5px solid var(--sc);min-width:0}
+  .stage .num{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;font-weight:800;color:#fff;font-size:16px;background:var(--sc)}
+  .stage h3{font-size:22px;margin:0;letter-spacing:-.01em}
+  .stage .one{font-size:15px;color:var(--mute);margin:0}
+  .chip{display:flex;align-items:center;gap:10px;border-radius:12px;padding:10px 12px;font-size:14px;font-weight:600;background:var(--ss)}
+  .chip .ico{font-size:22px;line-height:1}
+  .chip small{display:block;font-weight:500;color:var(--mute);font-size:12.5px}
+  .chip .status{margin-left:auto}
+  .or{font-size:12px;font-weight:700;color:var(--mute);text-align:center;letter-spacing:.1em}
+  .keybox{font-family:ui-monospace,Menlo,monospace;font-size:13px;background:var(--ss);border-radius:10px;padding:10px 12px;word-break:break-all}
+  .keybox b{display:block;font-family:-apple-system,sans-serif;font-size:12px;color:var(--mute);margin-bottom:3px;font-weight:600}
+  .branch svg{width:100%;height:auto;display:block;margin:0 auto}
+
+  /* journey */
+  .journey{display:grid;column-gap:16px}
+  .jlane{font-size:13px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--mute);padding-bottom:8px}
+  .jl{text-align:right} .jr{text-align:left}
+  .jmid{position:relative;display:grid;place-items:center}
+  .jmid::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:2px;margin-left:-1px;background:var(--line)}
+  .jmid.first::before{top:50%} .jmid.last::before{bottom:50%}
+  .jdot{position:relative;z-index:1;width:32px;height:32px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:14px;color:#fff;background:var(--sc)}
+  .jcell{padding:7px 0;display:flex}
+  .jcell.jl{justify-content:flex-end}
+  .jcard{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px 16px;display:flex;gap:12px;align-items:flex-start;max-width:470px;width:100%;text-align:left}
+  .jl .jcard{border-right:5px solid var(--sc)} .jr .jcard{border-left:5px solid var(--sc)}
+  .jcard .ico{font-size:24px;line-height:1.1}
+  .jcard b{display:block;font-size:16.5px;margin-bottom:2px}
+  .jcard span.one{display:block;color:var(--mute);font-size:14px}
+  .jcard .status{margin-top:8px}
+
+  /* screens */
+  .screens{display:grid;align-items:start}
+  .frame{background:var(--card);border:1px solid var(--line);border-top:4px solid var(--sc);border-radius:16px;overflow:hidden}
+  .bar{display:flex;gap:5px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line);font-size:11px;color:var(--mute);min-width:0}
+  .bar i{width:8px;height:8px;border-radius:50%;background:var(--line);flex:none}
+  .bar span{margin-left:6px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .sbody{padding:16px 14px;display:flex;flex-direction:column;gap:10px;min-height:200px}
+  .sh{font-weight:800;font-size:16px}
+  .stx{font-size:13px;color:var(--mute)}
+  .sin{border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px;color:var(--mute);background:var(--bg)}
+  .sbtn{background:var(--sc);color:#fff;border-radius:8px;padding:8px;text-align:center;font-weight:700;font-size:13px}
+  .sk{height:8px;border-radius:4px;background:var(--line)}
+  .cap{margin-top:10px} .cap b{display:block;font-size:16px} .cap span{font-size:13.5px;color:var(--mute)}
+  .via{display:flex;flex-direction:column;align-items:center;gap:2px;padding-top:96px;font-size:12px;color:var(--mute);text-align:center;font-weight:600}
+  .via .a{font-size:26px;font-weight:300;line-height:1}
+
+  /* layers */
+  .layers{display:flex;flex-direction:column}
+  .layer{display:grid;grid-template-columns:250px 1fr;gap:18px;align-items:center;background:var(--card);border:1px solid var(--line);border-left:6px solid var(--sc);border-radius:16px;padding:16px 20px}
+  .layer b{font-size:18px;display:block}
+  .layer .one{font-size:14px;color:var(--mute)}
+  .parts{display:flex;flex-wrap:wrap;gap:8px}
+  .part{background:var(--ss);border-radius:10px;padding:8px 12px;font-size:14px;font-weight:600;border:2px solid transparent}
+  .part.new{background:var(--news);color:var(--new);border:2px dashed var(--new)}
+  .between{text-align:center;color:var(--mute);font-size:12.5px;font-weight:700;padding:5px 0;letter-spacing:.06em}
+
+  /* records */
+  .store{display:grid;gap:16px}
+  .tcard{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px 18px;min-width:0}
+  .tcard.read{border-style:dashed}
+  .thead{display:flex;align-items:center;gap:10px;margin-bottom:4px;flex-wrap:wrap}
+  .tname{font-family:ui-monospace,Menlo,monospace;font-size:15px;font-weight:700}
+  .tq{font-size:13px;color:var(--mute);margin-bottom:10px}
+  .op{font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;border-radius:999px;padding:2px 9px;color:#fff;background:var(--mute)}
+  .stepn{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:13px;color:#fff;flex:none}
+  table.rows{width:100%;border-collapse:collapse;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+  table.rows th{text-align:left;font-weight:600;color:var(--mute);padding:4px 8px 4px 0;border-bottom:1px solid var(--line)}
+  table.rows td{padding:5px 8px 5px 0;border-bottom:1px solid var(--line)}
+  table.rows tr:last-child td{border-bottom:0}
+  .order{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0 0 16px}
+  .order .o{display:flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:5px 12px 5px 6px;font-size:13.5px;font-weight:600}
+  .order .sep{color:var(--mute)}
+
+  /* points */
+  .points{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px}
+  .pt{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:20px;display:flex;gap:14px;align-items:flex-start}
+  .pt .ico{font-size:30px;line-height:1}
+  .pt b{font-size:17px;display:block;margin-bottom:4px}
+  .pt span{color:var(--mute);font-size:14.5px}
+
+  /* changes */
+  .prop{background:var(--card);border:2px dashed var(--new);border-radius:20px;padding:24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:28px}
+  .prop h4{margin:0 0 8px;font-size:19px}
+  .prop p{margin:0;color:var(--mute);font-size:15px}
+  .badge{display:inline-block;background:var(--news);color:var(--new);font-weight:800;font-size:12px;letter-spacing:.08em;text-transform:uppercase;border-radius:999px;padding:3px 10px;margin-bottom:10px}
+  .mini{display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap}
+  .mini .box{border:1px solid var(--line);border-radius:10px;padding:6px 10px;font-size:13.5px;font-weight:600;background:var(--bg)}
+  .mini .new{border:2px dashed var(--new);color:var(--new)}
+  .mini .lbl{width:72px;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--mute)}
+  .mini .lbl.n{color:var(--new)}
+  .mini.gone .box{text-decoration:line-through;color:var(--skip)}
+
+  @media (max-width:980px){
+    .flow,.screens{grid-template-columns:1fr !important} .arrow,.via .a{transform:rotate(90deg)} .via{padding-top:6px}
+    .layer{grid-template-columns:1fr} .store{grid-template-columns:1fr !important}
+  }
+</style>
+</head>
+<body>
+<div class="page" id="page"></div>
+
+<script>
+/* ======================================================================
+   EDIT THIS OBJECT. Example content: a generic password reset.
+   Delete the sections you do not need; add more of any type.
+   ====================================================================== */
+const DOC = {
+  kicker: "Example · account recovery",
+  title: "How a password reset works",
+  lede: "The user asks for a link, opens it, and picks a new password.",
+
+  // Optional switch that redraws the same page for another case.
+  scenarios: [
+    { id: "known",   label: "👤 Known email" },
+    { id: "unknown", label: "❓ Unknown email" },
+  ],
+
+  sections: [
+    { type: "screens", title: "What the user sees",
+      items: [
+        { color: "c1", bar: "example.com/forgot", title: "Forgot password", line: "One field, one button",
+          blocks: [{ h: "Forgot password?" }, { input: "you@example.com" }, { button: "Send link" }], via: "submits" },
+        { color: "c1", bar: "example.com/forgot/sent", title: "Check your inbox", line: "Same message for every email",
+          blocks: [{ h: "Check your inbox" }, { text: "If the account exists, a link is on its way." }, { skeleton: 2 }],
+          via: s => s === "known" ? "opens link" : "no email arrives" },
+        { color: "c2", bar: "example.com/reset?t=…", title: "New password", line: "Link works once", dimIn: ["unknown"],
+          blocks: [{ h: "Choose a password" }, { input: "••••••••" }, { button: "Save" }], via: "saves" },
+        { color: "c4", bar: "example.com/home", title: "Signed in", line: "Other sessions end", dimIn: ["unknown"],
+          blocks: [{ h: "You're in" }, { pill: ["password changed", "ok"] }, { skeleton: 3 }] },
+      ] },
+
+    { type: "journey", title: "Who does what", lanes: ["👤 User", "⚙️ System"],
+      items: [
+        { lane: 0, icon: "✍️", title: "Asks for a reset", line: "Types an email, clicks Send link" },
+        { lane: 1, icon: "🔎", title: "Looks up the email",
+          line: s => s === "known" ? "An account matches" : "No match: stop quietly",
+          status: s => s === "known" ? ["found", "ok"] : ["not found", "off"] },
+        { lane: 1, icon: "🎲", title: "Creates a one-time token", line: "Valid for 30 minutes", dimIn: ["unknown"] },
+        { lane: 1, icon: "📨", title: "Sends the link", line: "Email, plus SMS if a phone is set",
+          status: s => s === "known" ? ["sent", "ok"] : ["skipped", "off"] },
+        { lane: 0, icon: "🔗", title: "Opens the link", line: "Picks a new password", dimIn: ["unknown"] },
+        { lane: 1, icon: "🔥", title: "Uses up the token", line: "Saves the password, signs the user in", dimIn: ["unknown"] },
+      ] },
+
+    { type: "steps", title: "Under the hood",
+      items: [
+        { color: "c1", title: "Request", line: "The form calls the API",
+          chips: [{ icon: "⏱️", title: "Rate limited", sub: "5 per hour per address" }] },
+        { color: "c2", title: "Token", line: "Random; only its hash is stored",
+          key: { label: "token hash", value: s => s === "known" ? "sha256:9f2c…e1" : "— none —" } },
+        { color: "c3", title: "Notify", line: "1 request → each channel → result", width: 1.5,
+          branch: {
+            root: { icon: "✉️", label: "1 request" },
+            children: s => s === "known" ? ["email", "sms"] : ["no account"],
+            leaves: (s, k) => k === "email" ? [{ icon: "📨", label: "sent", status: "ok" }, { icon: "👀", label: "opened", status: "ok" }]
+                         : k === "sms"   ? [{ icon: "📱", label: "sent", status: "ok" }, { icon: "👀", label: "unread", status: "wait" }]
+                         : [{ icon: "🤫", label: "nothing sent", status: "off" }],
+          } },
+        { color: "c4", title: "Reset", line: "Token checked, then deleted", dimIn: ["unknown"],
+          chips: [
+            { icon: "✅", title: "Password saved", status: s => s === "known" ? ["done", "ok"] : ["—", "off"] },
+            { icon: "🔒", title: "Old sessions end" },
+          ] },
+      ] },
+
+    { type: "layers", title: "Where each part runs", between: "↓ calls",
+      items: [
+        { color: "c1", name: "Web app", line: "Screens in the browser", parts: ["Forgot form", "Reset form"] },
+        { color: "c2", name: "API", line: "Checks and decides", parts: ["POST /password-resets", "rate limiter", { text: "passkey check", isNew: true }] },
+        { color: "c3", name: "Workers", line: "Slow work, off the request", parts: ["email sender", "sms sender"] },
+        { color: "c5", name: "Storage", line: "What is remembered", parts: ["users", "reset_tokens", "deliveries"] },
+      ] },
+
+    { type: "records", title: "What gets stored, in order", columns: 3,
+      // write order; kind: read | write | update | store (or set color: "c1".."c5")
+      order: [
+        { id: "A", kind: "read",   label: "find the user" },
+        { id: "B", kind: "write",  label: "save token hash" },
+        { id: "C", kind: "store",  label: "log each message" },
+        { id: "D", kind: "update", label: "mark token used" },
+      ],
+      items: [
+        { step: "A", name: "users", tag: "read only", read: true, question: "Who is this? <b>Nothing written.</b>",
+          columns: ["id", "email"], rows: s => s === "known" ? [["u_17", "ana@example.com"]] : [], empty: "no match" },
+        { step: "B", endStep: "D", name: "reset_tokens", tag: "1 per request", question: "Which link is valid?",
+          columns: ["user", "expires", "used"],
+          rows: s => s === "known" ? [["u_17", "10:30", "<wait>no</wait> → <ok>10:12</ok>"]] : [], empty: "no row: nothing to steal" },
+        { step: "C", name: "deliveries", tag: "1 per channel", question: "Did the message go out?",
+          columns: ["channel", "status"],
+          rows: s => s === "known" ? [["email", "<ok>sent</ok>"], ["sms", "<ok>sent</ok>"]] : [], empty: "no rows" },
+      ] },
+
+    { type: "points", title: "Why it is safe",
+      items: [
+        { icon: "🎲", title: "Unguessable link", line: "Only the hash is stored." },
+        { icon: "⌛", title: "Short-lived", line: "30 minutes, one use." },
+        { icon: "🤫", title: "Same answer for all", line: "Nobody learns who has an account." },
+        { icon: "⏱️", title: "Rate limited", line: "Mass guessing stops early." },
+      ] },
+
+    { type: "changes", title: "Proposed: what changes",
+      items: [
+        { badge: "new · in step 2", title: "Passkey recovery", line: "Skip the email when a passkey exists.",
+          before: ["request", "✉️ email", "🔗 link", "✅ in"],
+          after:  ["request", { text: "🔑 passkey", isNew: true }, "✅ in"] },
+        { badge: "changed · in step 2", title: "Shorter links", line: "Tokens expire sooner.",
+          before: ["⌛ 30 min"], after: [{ text: "⌛ 10 min", isNew: true }] },
+      ] },
+  ],
+};
+
+/* ======================================================================
+   Renderer. No need to edit below.
+   ====================================================================== */
+const v = (x, s) => (typeof x === "function" ? x(s) : x);
+const cssv = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const tg = t => String(t ?? "")
+  .replace(/<ok>(.*?)<\/ok>/g, '<span class="hl-ok">$1</span>')
+  .replace(/<wait>(.*?)<\/wait>/g, '<span class="hl-wait">$1</span>')
+  .replace(/<off>(.*?)<\/off>/g, '<span class="hl-off">$1</span>')
+  .replace(/<new>(.*?)<\/new>/g, '<span class="hl-new">$1</span>');
+const T = (x, s) => tg(v(x, s));
+const col = c => `--sc:var(--${c || "c1"});--ss:var(--${c || "c1"}s)`;
+const shown = (it, s) => it.show === undefined || v(it.show, s);
+const fade = (it, s) => (it.dimIn && it.dimIn.includes(s) ? "opacity:.28;" : "");
+const pill = st => (st ? `<span class="status st-${st[1] || "info"}">${st[0]}</span>` : "");
+const newTag = it => (it.isNew ? ` <span class="newtag">${it.newLabel || "new"}</span>` : "");
+const kindColor = k => ({ read: "var(--mute)", write: "var(--c3)", store: "var(--c2)", update: "var(--c4)" }[k] || "var(--c3)");
+let svgN = 0, branches = [];
+
+const R = {
+  steps(sec, s) {
+    const it = sec.items.filter(x => shown(x, s));
+    const cols = it.map((x, i) => `minmax(0,${x.width || 1}fr)` + (i < it.length - 1 ? " 36px" : "")).join(" ");
+    return `<div class="flow" style="grid-template-columns:${cols}">` + it.map((x, i) => {
+      let h = `<div class="stage ${x.isNew ? "isnew" : ""}" style="${col(x.color)};${fade(x, s)}"><div class="num">${i + 1}</div><h3>${T(x.title, s)}${newTag(x)}</h3><p class="one">${T(x.line, s)}</p>`;
+      if (x.key) h += `<div class="keybox"><b>${x.key.label}</b>${T(x.key.value, s)}</div>`;
+      (x.chips || []).filter(c => shown(c, s)).forEach(c => {
+        if (c.sep || c.or) { h += `<div class="or">${c.sep || "AND / OR"}</div>`; return; }
+        h += `<div class="chip" style="${fade(c, s)}"><span class="ico">${c.icon || ""}</span><div>${T(c.title, s)}<small>${T(c.sub, s)}</small></div>${pill(v(c.status, s))}</div>`;
+      });
+      if (x.branch) h += branchSlot(x.branch, s, false);
+      return h + `</div>` + (i < it.length - 1 ? `<div class="arrow">→</div>` : "");
+    }).join("") + `</div>`;
+  },
+
+  journey(sec, s) {
+    const it = sec.items.filter(x => shown(x, s)), two = (sec.lanes || []).length > 1;
+    const lc = sec.laneColors || ["c1", "c2"];
+    let h = `<div class="journey" style="grid-template-columns:${two ? "1fr 56px 1fr" : "56px 1fr"}">`;
+    if (sec.lanes) h += two ? `<div class="jlane jl">${sec.lanes[0]}</div><div></div><div class="jlane jr">${sec.lanes[1]}</div>` : `<div></div><div class="jlane jr">${sec.lanes[0]}</div>`;
+    it.forEach((x, i) => {
+      const c = x.color || lc[two ? (x.lane || 0) : 0], left = two && !x.lane;
+      const card = `<div class="jcard ${x.isNew ? "isnew" : ""}" style="${col(c)};${fade(x, s)}"><span class="ico">${x.icon || ""}</span><div><b>${T(x.title, s)}${newTag(x)}</b><span class="one">${T(x.line, s)}</span>${pill(v(x.status, s))}</div></div>`;
+      const mid = `<div class="jmid ${i === 0 ? "first" : ""} ${i === it.length - 1 ? "last" : ""}"><span class="jdot" style="${col(c)};${fade(x, s)}">${i + 1}</span></div>`;
+      if (two) h += `<div class="jcell jl" style="${col(c)}">${left ? card : ""}</div>${mid}<div class="jcell jr" style="${col(c)}">${left ? "" : card}</div>`;
+      else h += `${mid}<div class="jcell jr" style="${col(c)}">${card}</div>`;
+    });
+    return h + `</div>`;
+  },
+
+  screens(sec, s) {
+    const it = sec.items.filter(x => shown(x, s));
+    const cols = it.map((_, i) => "minmax(0,1fr)" + (i < it.length - 1 ? " 92px" : "")).join(" ");
+    const block = b => typeof b === "string" ? `<div class="stx">${tg(b)}</div>`
+      : b.h ? `<div class="sh">${tg(b.h)}</div>` : b.text ? `<div class="stx">${tg(b.text)}</div>`
+      : b.input ? `<div class="sin">${tg(b.input)}</div>` : b.button ? `<div class="sbtn">${tg(b.button)}</div>`
+      : b.pill ? `<div>${pill(b.pill)}</div>` : b.skeleton ? Array.from({ length: b.skeleton }, (_, k) => `<div class="sk" style="width:${92 - k * 17}%"></div>`).join("") : "";
+    return `<div class="screens" style="grid-template-columns:${cols}">` + it.map((x, i) =>
+      `<div style="${col(x.color)};${fade(x, s)}"><div class="frame ${x.isNew ? "isnew" : ""}"><div class="bar"><i></i><i></i><i></i><span>${T(x.bar, s)}</span></div><div class="sbody">${(v(x.blocks, s) || []).map(block).join("")}</div></div><div class="cap"><b>${T(x.title, s)}${newTag(x)}</b><span>${T(x.line, s)}</span></div></div>`
+      + (i < it.length - 1 ? `<div class="via"><span class="a">→</span>${T(x.via, s)}</div>` : "")).join("") + `</div>`;
+  },
+
+  layers(sec, s) {
+    const it = sec.items.filter(x => shown(x, s));
+    return `<div class="layers">` + it.map((x, i) =>
+      `<div class="layer ${x.isNew ? "isnew" : ""}" style="${col(x.color)};${fade(x, s)}"><div><b>${T(x.name, s)}${newTag(x)}</b><span class="one">${T(x.line, s)}</span></div><div class="parts">${(v(x.parts, s) || []).map(p => typeof p === "string" ? `<span class="part">${tg(p)}</span>` : `<span class="part ${p.isNew ? "new" : ""}" style="${fade(p, s)}">${tg(p.text)}</span>`).join("")}</div></div>`
+      + (i < it.length - 1 && sec.between ? `<div class="between">${T(sec.between, s)}</div>` : (i < it.length - 1 ? `<div style="height:10px"></div>` : ""))).join("") + `</div>`;
+  },
+
+  branch(sec, s) { return branchSlot(sec, s, true); },
+
+  records(sec, s) {
+    const color = Object.fromEntries((sec.order || []).map(o => [o.id, o.color ? `var(--${o.color})` : kindColor(o.kind)]));
+    let h = "";
+    if (sec.order) h += `<div class="order">${sec.order.map(o => `<span class="o"><span class="stepn" style="background:${color[o.id]}">${o.id}</span>${T(o.label, s)}</span>`).join('<span class="sep">→</span>')}</div>`;
+    h += `<div class="store" style="grid-template-columns:repeat(${sec.columns || 2},minmax(0,1fr))">`;
+    sec.items.filter(t => shown(t, s)).forEach(t => {
+      const c = color[t.step] || "var(--mute)";
+      h += `<div class="tcard ${t.read ? "read" : ""} ${t.isNew ? "isnew" : ""}" style="${fade(t, s)}"><div class="thead">${t.step ? `<span class="stepn" style="background:${c}">${t.step}</span>` : ""}<span class="tname">${T(t.name, s)}</span>${t.tag ? `<span class="op" style="background:${c}">${T(t.tag, s)}</span>` : ""}${newTag(t)}${t.endStep ? `<span class="stepn" style="margin-left:auto;background:${color[t.endStep]}">${t.endStep}</span>` : ""}</div><div class="tq">${T(t.question, s)}</div>`;
+      if (t.columns) {
+        const rows = v(t.rows, s) || [];
+        h += `<table class="rows"><thead><tr>${t.columns.map(c => `<th>${c}</th>`).join("")}</tr></thead><tbody>${rows.length ? rows.map(r => `<tr>${r.map(c => `<td>${tg(c)}</td>`).join("")}</tr>`).join("") : `<tr><td colspan="${t.columns.length}" style="color:var(--mute)">${T(t.empty, s) || "no rows"}</td></tr>`}</tbody></table>`;
+      }
+      h += `</div>`;
+    });
+    return h + `</div>`;
+  },
+
+  points(sec, s) {
+    return `<div class="points">` + sec.items.filter(x => shown(x, s)).map(n =>
+      `<div class="pt ${n.isNew ? "isnew" : ""}" style="${fade(n, s)}"><span class="ico">${n.icon || ""}</span><div><b>${T(n.title, s)}${newTag(n)}</b><span>${T(n.line, s)}</span></div></div>`).join("") + `</div>`;
+  },
+
+  changes(sec, s) {
+    const chain = (arr, lbl, cls) => `<div class="mini ${cls || ""}">${lbl ? `<span class="lbl ${cls === "n" ? "n" : ""}">${lbl}</span>` : ""}${v(arr, s).map(c => typeof c === "string" ? `<span class="box">${tg(c)}</span>` : `<span class="box ${c.isNew ? "new" : ""}">${tg(c.text)}</span>`).join("<span>→</span>")}</div>`;
+    return `<div class="prop">` + sec.items.filter(x => shown(x, s)).map(it =>
+      `<div>${it.badge ? `<span class="badge">${T(it.badge, s)}</span>` : ""}<h4>${T(it.title, s)}</h4><p>${T(it.line, s)}</p>`
+      + (it.chain ? chain(it.chain) : "")
+      + (it.before ? chain(it.before, sec.beforeLabel || "Today") : "")
+      + (it.after ? chain(it.after, sec.afterLabel || "Proposed", "n") : "") + `</div>`).join("") + `</div>`;
+  },
+};
+
+function branchSlot(B, s, standalone) {
+  const id = "br" + (++svgN); branches.push([id, B, standalone]);
+  return `<div class="branch"><svg id="${id}"></svg></div>`;
+}
+
+function drawBranch(id, B, s, standalone) {
+  const kids = v(B.children, s) || [];
+  const L = kids.map(k => (typeof B.leaves === "function" ? B.leaves(s, k) : B.leaves) || []);
+  const gap = 34, kidGap = 14;
+  const blockH = L.map(l => Math.max(1, l.length) * gap);
+  const total = blockH.reduce((a, b) => a + b, 0) + kidGap * Math.max(0, kids.length - 1);
+  const H = Math.max(total + 24, 136), r = 28, rl = B.root.label || "";
+  const root = { x: Math.max(34, rl.length * 4.2 + 6), y: H / 2 };
+  const kw = Math.max(56, Math.max(0, ...kids.map(k => String(k).length)) * 8.6 + 26);
+  const kx = root.x + r + 46, lx = kx + kw + 40;
+  const hasIco = L.some(l => l.some(x => x.icon)), px = lx + (hasIco ? 24 : 0);
+  const lw = Math.max(64, Math.max(0, ...L.flat().map(x => String(x.label).length)) * 7.4 + 22);
+  const W = px + lw + 4;
+  const kc = cssv("--" + (B.color || "c3"));
+  const fill = { ok: cssv("--c4"), wait: cssv("--c3"), info: cssv("--c1"), off: cssv("--skips"), new: cssv("--news") };
+  const ink = { off: cssv("--skip"), new: cssv("--new") };
+  let y0 = (H - total) / 2, g = "";
+  const ky = blockH.map(bh => { const y = y0 + bh / 2; y0 += bh + kidGap; return y; });
+  kids.forEach((k, i) => {
+    g += `<path d="M${root.x + r} ${root.y} C ${kx - 20} ${root.y}, ${kx - 26} ${ky[i]}, ${kx} ${ky[i]}" stroke="${kc}" stroke-width="3" fill="none"/>`;
+    L[i].forEach((l, j) => {
+      const y = ky[i] + (j - (L[i].length - 1) / 2) * gap;
+      g += `<path d="M${kx + kw} ${ky[i]} C ${lx - 16} ${ky[i]}, ${lx - 20} ${y}, ${lx - 2} ${y}" stroke="${cssv("--mute")}" stroke-opacity=".5" stroke-width="2" fill="none"/>`;
+    });
+  });
+  g += `<circle cx="${root.x}" cy="${root.y}" r="${r}" fill="${cssv("--" + (B.rootColor || "c2"))}"/><text x="${root.x}" y="${root.y + 8}" text-anchor="middle" font-size="23">${B.root.icon || ""}</text><text x="${root.x}" y="${root.y + r + 20}" text-anchor="middle" font-weight="700" font-size="14" fill="${cssv("--mute")}">${rl}</text>`;
+  kids.forEach((k, i) => {
+    g += `<rect x="${kx}" y="${ky[i] - 17}" width="${kw}" height="34" rx="17" fill="${kc}"/><text x="${kx + kw / 2}" y="${ky[i] + 5}" text-anchor="middle" font-weight="700" font-size="14.5" fill="#fff">${k}</text>`;
+    L[i].forEach((l, j) => {
+      const y = ky[i] + (j - (L[i].length - 1) / 2) * gap, st = l.status || "info";
+      if (l.icon) g += `<text x="${lx}" y="${y + 6}" font-size="16">${l.icon}</text>`;
+      g += `<rect x="${px}" y="${y - 12}" width="${lw}" height="24" rx="12" fill="${fill[st] || fill.info}" ${st === "off" ? `stroke="${cssv("--line")}"` : st === "new" ? `stroke="${cssv("--new")}" stroke-dasharray="4 3"` : ""}/><text x="${px + lw / 2}" y="${y + 5}" text-anchor="middle" font-weight="700" font-size="13" fill="${ink[st] || "#fff"}">${l.label}</text>`;
+    });
+  });
+  const el = document.getElementById(id);
+  el.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  if (standalone) el.style.maxWidth = Math.round(W * 1.5) + "px";
+  el.innerHTML = g;
+}
+
+function render(s) {
+  svgN = 0; branches = [];
+  let h = `${DOC.kicker ? `<div class="kicker">${DOC.kicker}</div>` : ""}<h1>${T(DOC.title, s)}</h1>${DOC.lede ? `<p class="lede">${T(DOC.lede, s)}</p>` : ""}`;
+  if (DOC.scenarios?.length > 1)
+    h += `<div class="switch">${DOC.scenarios.map(x => `<button data-s="${x.id}" class="${x.id === s ? "on" : ""}">${x.label}</button>`).join("")}</div>`;
+  (DOC.sections || []).filter(sec => shown(sec, s)).forEach(sec => {
+    const fn = R[sec.type];
+    if (!fn) { console.warn("unknown section type", sec.type); return; }
+    h += `<section>${sec.title ? `<h2>${T(sec.title, s)}</h2>` : ""}${sec.note ? `<p class="note">${T(sec.note, s)}</p>` : ""}${fn(sec, s)}</section>`;
+  });
+  document.getElementById("page").innerHTML = h;
+  document.querySelectorAll(".switch button").forEach(b => b.onclick = () => { history.replaceState(null, "", "#" + b.dataset.s); render(b.dataset.s); });
+  branches.forEach(([id, B, st]) => drawBranch(id, B, s, st));
+  document.documentElement.dataset.height = Math.ceil(document.getElementById("page").getBoundingClientRect().height);
+}
+
+const ids = (DOC.scenarios || []).map(x => x.id);
+render(ids.includes(location.hash.slice(1)) ? location.hash.slice(1) : (ids[0] || null));
+</script>
+</body>
+</html>
