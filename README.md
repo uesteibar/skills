@@ -27,7 +27,8 @@ install the skill.
 
 | Skill | What it does |
 | --- | --- |
-| [`ui-design`](docs/ui-design.md) | Short principles for any interface design task. |
+| [`ui-design`](docs/ui-design.md) | Short, ordered process for any interface design task. |
+| [`find-icon-opportunities`](docs/find-icon-opportunities.md) | Decide where a UI needs icons, which ones, and whether they need text. |
 | [`apple-ios-design`](docs/apple-ios-design.md) | Design and audit iPhone and iPad interfaces. |
 | [`material-android-design`](docs/material-android-design.md) | Design and audit Android interfaces with Material 3. |
 | [`mobile-product-design`](docs/mobile-product-design.md) | Coordinate one product's design across iOS and Android. |
