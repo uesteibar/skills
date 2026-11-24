@@ -28,6 +28,7 @@ install the skill.
 | Skill | What it does |
 | --- | --- |
 | [`ui-design`](docs/ui-design.md) | Short, ordered process for any interface design task. |
+| [`landing-design`](docs/landing-design.md) | Design a product landing page that tells a convincing story, from references to verified result. |
 | [`find-icon-opportunities`](docs/find-icon-opportunities.md) | Decide where a UI needs icons, which ones, and whether they need text. |
 | [`apple-ios-design`](docs/apple-ios-design.md) | Design and audit iPhone and iPad interfaces. |
 | [`material-android-design`](docs/material-android-design.md) | Design and audit Android interfaces with Material 3. |
@@ -58,7 +59,7 @@ description to the prompt.
 - **PostHog connector:** `posthog-product-analytics`.
 - **Hermes:** `pr-shepherd`, `pi-shepherd` and `skill-housekeeping` keep state or find skill folders under `$HERMES_HOME` by default. Each has an environment variable or option to change that; see its page.
 
-Skills that call each other: `pr-creation` uses `review-outline` and the records from `verification-evidence`; `mobile-product-design` coordinates `apple-ios-design` and `material-android-design`.
+Skills that call each other: `pr-creation` uses `review-outline` and the records from `verification-evidence`; `mobile-product-design` coordinates `apple-ios-design` and `material-android-design`. `landing-design` uses `ui-design`, `find-icon-opportunities` and `verification-evidence`, plus Emil Kowalski's animation skills from [emilkowalski/skills](https://github.com/emilkowalski/skills) (not in this repository).
 
 ## Side effects to know about
 
